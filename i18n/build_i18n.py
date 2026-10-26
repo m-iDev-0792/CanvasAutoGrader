@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+从中文源文件 canvas_grader_gui.py 生成英文 / 韩文版本
+======================================================
+中文版 canvas_grader_gui.py 是唯一的源代码; 其他语言版本由本脚本生成, 不要直接修改。
+
+  python3 i18n/build_i18n.py extract   把源文件里新增的中文字符串/注释加进 i18n/<lang>.json (值为 null = 待翻译)
+  python3 i18n/build_i18n.py build     检查翻译并生成 canvas_grader_gui_en.py / canvas_grader_gui_ko.py
+  python3 i18n/build_i18n.py check     只检查, 不生成
+
+修改 canvas_grader_gui.py 后: extract → 翻译 json 里值为 null 的条目 → build
+
+翻译文件格式: {"<源代码里的原文>": "<译文>"}
+  - 原文是完整的 Python 字面量 (带引号和 f/r 前缀) 或注释 (# 开头)
+  - 译文也必须是同类的合法字面量 / 注释; f-string 里的 {表达式} 必须原样保留
+"""
+
+import ast
+import io
+import json
+import re
+import sys
+import tokenize
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE = ROOT / "canvas_grader_gui.py"
+LANGS = {"en": "English", "ko": "한국어"}
+CJK = re.compile(r"[　-〿一-鿿＀-￯]")
+HAN = re.compile(r"[一-鿿]")          # 译文里不应再出现汉字
+FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+
+
+def segments(src: str) -> list[tuple[int, int, str]]:
+    """找出源代码里所有含中文的字符串字面量 / 注释, 返回 (起始偏移, 结束偏移, 原文)"""
+    line_start = [0]
+    for line in src.splitlines(keepends=True):
+        line_start.append(line_start[-1] + len(line))
+
+    def offset(pos):
+        return line_start[pos[0] - 1] + pos[1]
+
+    spans, depth, start = [], 0, None
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if FSTRING_START is not None and tok.type == FSTRING_START:   # Python 3.12+: f-string 拆成多个 token
+            if depth == 0:
+                start = tok.start
+            depth += 1
+        elif FSTRING_END is not None and tok.type == FSTRING_END:
+            depth -= 1
+            if depth == 0:
+                spans.append((offset(start), offset(tok.end)))
+        elif depth == 0 and tok.type in (tokenize.STRING, tokenize.COMMENT):
+            spans.append((offset(tok.start), offset(tok.end)))
+    return [(a, b, src[a:b]) for a, b in spans if CJK.search(src[a:b])]
+
+
+class _BlankStrings(ast.NodeTransformer):
+    def visit_Constant(self, node):
+        return ast.Constant("") if isinstance(node.value, str) else node
+
+
+def literal_info(text: str):
+    """字面量 → (类型, f-string 表达式列表)"""
+    node = ast.parse(text.strip(), mode="eval").body
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return "str", []
+    if isinstance(node, ast.JoinedStr):
+        # 表达式里的字符串常量 (例如 {'✅' if ok else '未安装'}) 允许翻译, 比较前先清空
+        exprs = sorted(ast.unparse(_BlankStrings().visit(v)) for v in node.values
+                       if isinstance(v, ast.FormattedValue))
+        return "fstr", exprs
+    raise ValueError(f"不是字符串字面量: {type(node).__name__}")
+
+
+def validate(src: str, dst) -> str:
+    """返回错误说明; 没问题返回空字符串"""
+    if not isinstance(dst, str) or not dst:
+        return "缺少翻译"
+    if HAN.search(dst):
+        return "译文里还有汉字"
+    if src.startswith("#"):
+        if not dst.startswith("#") or "\n" in dst:
+            return "注释的译文必须以 # 开头且只有一行"
+        return ""
+    try:
+        kind_src, exprs_src = literal_info(src)
+        kind_dst, exprs_dst = literal_info(dst)
+    except (SyntaxError, ValueError) as e:
+        return f"不是合法的字符串字面量: {e}"
+    if kind_src != kind_dst:
+        return f"字面量类型不同 ({kind_src} → {kind_dst})"
+    if exprs_src != exprs_dst:
+        return f"f-string 表达式不一致: {exprs_src} → {exprs_dst}"
+    return ""
+
+
+def load(lang: str) -> dict:
+    path = ROOT / "i18n" / f"{lang}.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def save(lang: str, table: dict):
+    path = ROOT / "i18n" / f"{lang}.json"
+    path.write_text(json.dumps(table, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def extract():
+    src = SOURCE.read_text(encoding="utf-8")
+    keys = list(dict.fromkeys(text for _, _, text in segments(src)))
+    for lang in LANGS:
+        old = load(lang)
+        table = {k: old.get(k) for k in keys}
+        stale = [k for k in old if k not in table]
+        save(lang, table)
+        todo = sum(1 for v in table.values() if not v)
+        print(f"{lang}: {len(table)} 条, 待翻译 {todo}, 已删除过时条目 {len(stale)}")
+
+
+def check_and_build(write: bool) -> bool:
+    src = SOURCE.read_text(encoding="utf-8")
+    segs = segments(src)
+    ok = True
+    for lang, lang_name in LANGS.items():
+        table = load(lang)
+        errors = [(text, validate(text, table.get(text))) for text in dict.fromkeys(t for _, _, t in segs)]
+        errors = [(t, e) for t, e in errors if e]
+        if errors:
+            ok = False
+            print(f"✘ {lang}: {len(errors)} 个问题 (先运行 extract, 再修正 i18n/{lang}.json)")
+            for text, err in errors[:30]:
+                print(f"   {err}:  {text[:90]!r}")
+            continue
+        out = src
+        for a, b, text in reversed(segs):
+            out = out[:a] + table[text] + out[b:]
+        header = (f"# AUTO-GENERATED {lang_name} version of canvas_grader_gui.py — do not edit this file.\n"
+                  f"# Edit canvas_grader_gui.py and i18n/{lang}.json, then run: python3 i18n/build_i18n.py build\n")
+        lines = out.split("\n", 1)
+        out = lines[0] + "\n" + header + lines[1] if lines[0].startswith("#!") else header + out
+        try:
+            compile(out, f"canvas_grader_gui_{lang}.py", "exec")
+        except SyntaxError as e:
+            ok = False
+            print(f"✘ {lang}: 生成的代码有语法错误: {e}")
+            continue
+        if write:
+            target = ROOT / f"canvas_grader_gui_{lang}.py"
+            target.write_text(out, encoding="utf-8")
+            target.chmod(0o755)
+            print(f"✔ {target.name}")
+        else:
+            print(f"✔ {lang}: {len(set(t for _, _, t in segs))} 条翻译全部通过检查")
+    return ok
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "build"
+    if cmd == "extract":
+        extract()
+    elif cmd in ("build", "check"):
+        sys.exit(0 if check_and_build(write=(cmd == "build")) else 1)
+    else:
+        print(__doc__)
+        sys.exit(1)

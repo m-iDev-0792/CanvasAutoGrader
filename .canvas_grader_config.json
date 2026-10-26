@@ -1,0 +1,20 @@
+{
+  "base_url": "https://canvas.ubc.ca",
+  "course": "COSC_O 329 001 2026W1 Learning Analytics (196114)",
+  "assignment_id": "2518217",
+  "workspace": "/Users/zhenbanghe/Desktop/UBCO/TA-Course/COSC 329 - Bowen/section6/Reading6",
+  "with_comments": true,
+  "extract": true,
+  "grades_path": "/Users/zhenbanghe/Desktop/UBCO/TA-Course/COSC 329 - Bowen/section6/Reading6/grades.csv",
+  "delay": 0.5,
+  "ai_solution": "Reading6",
+  "ai_only_ungraded": true,
+  "ai_extra": "",
+  "sections": [],
+  "ai_template": "cosc329",
+  "ai_solutions_dir": "/Users/zhenbanghe/Desktop/UBCO/TA-Course/COSC 329 - Bowen/section6",
+  "ai_solutions_dirs": {
+    "cosc329": "/Users/zhenbanghe/Desktop/UBCO/TA-Course/COSC 329 - Bowen/section6",
+    "cosc111": "/Users/zhenbanghe/Desktop/UBCO/TA-Course/AutoGrader/Assignment Solutions"
+  }
+}
