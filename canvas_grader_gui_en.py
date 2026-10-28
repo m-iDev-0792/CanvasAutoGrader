@@ -69,7 +69,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -90,6 +90,23 @@ LAB_RE = re.compile(r"\b(L\d{1,3})\b")
 DOWNLOAD_WORKERS = 4
 LOGIN_TIMEOUT = 300   # Maximum time (seconds) to wait for manual login
 NEW_QUIZ_UI_TIMEOUT = 90_000   # Max time to wait for the New Quizzes grading view inside SpeedGrader (ms)
+CLASSIC_QUIZ_UI_TIMEOUT = 90_000   # Max time to wait for the Classic Quiz page inside SpeedGrader to load / reload after Update Scores (ms)
+# Submission modes in ③ Submit Grades: (internal name, label, description)
+SUBMIT_MODES = [
+    ("auto", "Auto (choose by assignment type and grades.csv)",
+     "For New Quizzes / Classic Quiz assignments whose grades.csv has per-question columns (Q1, Q2, ...), grade question by question in SpeedGrader; "
+     "otherwise submit the total via the API (rubric scores when there is a rubric)"),
+    ("api", "API: total score / rubric scores + overall comment only",
+     "Sets the total directly with the Canvas API (rubric scores when there is a rubric) and adds the overall comment. Per-question scores inside the quiz are not changed, "
+     "the Q<n>_comment columns are not submitted"),
+    ("new_quiz_ui", "New Quizzes: grade each question in SpeedGrader (Playwright)",
+     "Opens a browser and enters each question's points in the New Quizzes grading view (Award full credit / Mark as incorrect / partial credit), "
+     "writes Q<n>_comment into that question's Feedback and clicks Update; the overall comment is added via the API"),
+    ("classic_quiz_ui", "Classic Quiz: grade each question + Additional Comments in SpeedGrader (Playwright)",
+     "Opens a browser, enters each question's points on the Classic Quiz page, writes Q<n>_comment into the Additional Comments box under that question, "
+     "and clicks Update Scores; the overall comment is added via the API. Only the attempt shown by default (the latest) is changed; "
+     "students whose attempt does not match the one recorded in manifest.csv are skipped"),
+]
 QUESTION_COL_RE = re.compile(r"^Q(\d+)$")   # Per-question score columns for New Quizzes in grades.csv: Q1, Q2, ...
 QUESTION_COMMENT_COL_RE = re.compile(r"^Q(\d+)_comment$")   # Per-question comment columns: Q1_comment, Q2_comment, ...
 JSON_PREFIX = "while(1);"   # Anti-hijacking prefix Canvas adds to JSON responses for cookie auth
@@ -484,7 +501,7 @@ def unique_path(path: Path) -> Path:
 
 def write_rubric_json(workspace: Path, base_url: str, course_id: str, assignment: dict,
                       questions: list = None):
-    """questions: New Quizzes questions [{"position", "points"}]; if omitted, keep the ones already in rubric.json"""
+    """questions: quiz questions [{"position", "points", "text", "id" (Classic Quiz)}]; if omitted, keep the ones already in rubric.json"""
     workspace.mkdir(parents=True, exist_ok=True)
     path = workspace / "rubric.json"
     if questions is None and path.exists():
@@ -535,9 +552,29 @@ def new_quiz_questions(api: "CanvasAPI", course_id: str, assignment_id: str) -> 
     return questions, ""
 
 
+def classic_quiz_questions(api: "CanvasAPI", course_id: str, assignment: dict) -> tuple[list, str]:
+    """Classic Quiz question list (position + points + start of the question text + question id), used for the per-question columns in grades.csv.
+    Positions match "Question N" on the quiz page (text-only items are not numbered). With question groups (random questions) every student gets different questions, so an empty list is returned"""
+    quiz_id = assignment.get("quiz_id")
+    if not quiz_id:
+        return [], "Could not find this Classic Quiz's quiz_id — no per-question columns added; only the total will be submitted"
+    items = api.get_all(f"/courses/{course_id}/quizzes/{quiz_id}/questions")
+    if any(q.get("quiz_group_id") for q in items):
+        return [], "The quiz has question groups (random questions), so students may get different questions — no per-question columns added; only the total will be submitted"
+    questions, n = [], 0
+    for q in sorted(items, key=lambda q: q.get("position") or 0):
+        if q.get("question_type") == "text_only_question":
+            continue   # text-only item: not numbered on the quiz page and not scored
+        n += 1
+        text = html_to_text(q.get("question_text") or "")
+        questions.append({"position": n, "points": q.get("points_possible"), "id": str(q.get("id")),
+                          "text": " ".join(text.split())[:80]})
+    return questions, ""
+
+
 def write_grades_template(path: Path, criteria: list, students: list, with_comments: bool,
                           questions: list = None):
-    """questions: questions of a New Quizzes assignment (no rubric); adds one column Q<n> per question for per-question grading"""
+    """questions: questions of a quiz assignment (New Quizzes / Classic Quiz, no rubric); adds one column Q<n> per question for per-question grading"""
     header = ["student_id", "student_name", "student_number", "section", "status"]
     legend = ["#rubric", "(legend row, not submitted)", "", "", ""]
     if criteria:
@@ -1802,10 +1839,11 @@ def grade_new_quiz_student(page, base_url: str, course_id: str, assignment_id: s
     return expected
 
 
-def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
-                       delay: float, log, progress, stop_event: threading.Event,
-                       questions: list = None) -> tuple[int, int]:
-    """New Quizzes: students with per-question scores are graded question by question in SpeedGrader; the rest (e.g. missing students) get the total via the API"""
+def _submit_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                    delay: float, log, progress, stop_event: threading.Event,
+                    questions: list, grade_student) -> tuple[int, int]:
+    """Students with per-question scores are graded question by question in SpeedGrader (grade_student: the page steps for New Quizzes / Classic Quiz),
+    the rest (e.g. missing students) get the total directly via the API"""
     try:
         from playwright.sync_api import Error as PlaywrightError, sync_playwright
     except ImportError:
@@ -1852,8 +1890,8 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
                     break
                 log(f"[{i}/{len(ui)}] {e['name']} ({e['student_id']}): {e['score']:g}")
                 try:
-                    final = grade_new_quiz_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
-                                                   net_errors, questions)
+                    final = grade_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
+                                          net_errors, questions)
                     if abs(final - e["score"]) > 1e-6:
                         log(f"      ⚠️ Quiz total {final:g} does not match {e['score']:g} in grades.csv (the quiz may have Fudge Points "
                             "or scores on other questions)")
@@ -1888,6 +1926,299 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
             except PlaywrightError:
                 pass
     return success, failed
+
+
+def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                       delay: float, log, progress, stop_event: threading.Event,
+                       questions: list = None) -> tuple[int, int]:
+    """New Quizzes: students with per-question scores are graded question by question in SpeedGrader; the rest (e.g. missing students) get the total via the API"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_new_quiz_student)
+
+
+# ============================================================================
+# Classic Quiz: grade question by question on the quiz page (quiz history page) inside SpeedGrader
+# ============================================================================
+# The Classic Quiz grading page differs from New Quizzes: each question has a single score box (no Award full credit / ✕ buttons),
+# an "Additional Comments:" box sits under each question, and Fudge Points and "Update Scores" are at the bottom (a plain form submit; the page reloads).
+# Page structure (iframe #submission-preview-iframe → /courses/<c>/quizzes/<q>/history):
+#   div.question#question_<id>   .question_name "Question 3"   .question_points "/ 2"
+#   input[name=question_score_<id>_visible]  (the visible score; the page script copies it into the hidden question_score_<id>)
+#   textarea[name=question_comment_<id>]     (Additional Comments)
+#   form#update_history_form  input[name=submission_version_number] (which attempt is shown)  button.update-scores
+CLASSIC_QUIZ_JS = r"""
+(() => {
+  const questions = () => [...document.querySelectorAll('div.question')].filter(q => /^question_\d+$/.test(q.id));
+  const position = q => {
+    const t = q.querySelector('.question_name');
+    const m = t ? t.innerText.match(/\d+/) : null;
+    return m ? +m[0] : null;
+  };
+  window.__autograder_classic = {
+    read() {
+      const out = {};
+      for (const q of questions()) {
+        const n = position(q);
+        if (n === null) continue;
+        const id = q.id.slice('question_'.length);
+        const vis = q.querySelector(`input[name="question_score_${id}_visible"]`);
+        const hid = q.querySelector(`input[name="question_score_${id}"]`);
+        const cmt = q.querySelector(`textarea[name="question_comment_${id}"]`);
+        const pts = q.querySelector('.question_points');
+        const max = pts ? pts.innerText.match(/(\d+(?:\.\d+)?)/) : null;
+        const txt = q.querySelector('.question_text');
+        out[n] = {id, value: vis ? vis.value : null, hidden: hid ? hid.value : null, max: max ? +max[1] : null,
+                  comment: cmt ? cmt.value : null, text: txt ? txt.innerText.slice(0, 800) : ''};
+      }
+      return out;
+    },
+    meta() {
+      const val = sel => { const e = document.querySelector(sel); return e ? e.value : null; };
+      const fs = document.querySelector('.update_scores_final_score');
+      const form = document.querySelector('#update_history_form');
+      return {form: !!form, action: form ? form.getAttribute('action') : null,
+              button: !!document.querySelector('#update_history_form button.update-scores'),
+              fudge: val('#fudge_points_input'),
+              version: val('#update_history_form input[name="submission_version_number"]'),
+              final: fs ? fs.innerText : ''};
+    },
+    // the page script (jQuery) copies the visible score into the hidden field on change; trigger it if typing did not
+    resync(id) {
+      const vis = document.querySelector(`input[name="question_score_${id}_visible"]`);
+      if (!vis) return false;
+      if (window.jQuery) window.jQuery(vis).trigger('change');
+      else vis.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    },
+  };
+  return true;
+})()
+"""
+
+
+def _classic_final_score(text: str):
+    """"Final Score: 19 out of 21" -> 19"""
+    found = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:out of|/)\s*\d+(?:\.\d+)?", text or "")
+    return float(found[-1]) if found else None
+
+
+def _frame_user(url: str):
+    return (parse_qs(urlparse(url or "").query).get("user_id") or [None])[0]
+
+
+def _classic_frame(page, timeout: int, student_id: str = None):
+    """The quiz page (iframe) inside SpeedGrader; returns the Frame once the page shows its form.
+    With student_id, also wait until the iframe shows this student's quiz page (user_id in the URL), so the previous student's page is never filled in"""
+    deadline = time.time() + timeout / 1000
+    while True:
+        handle = page.locator("#submission-preview-iframe").element_handle(timeout=timeout)
+        frame = handle.content_frame() if handle else None
+        if frame is not None and "/quizzes/" in (frame.url or ""):
+            uid = _frame_user(frame.url)
+            if student_id is None or uid is None or uid == str(student_id):
+                break
+        if time.time() > deadline:
+            if frame is None:
+                raise RuntimeError("Quiz grading view (iframe) not found")
+            raise RuntimeError(f"SpeedGrader did not open this student's quiz page (the iframe shows user_id={_frame_user(frame.url)})")
+        page.wait_for_timeout(300)
+    frame.wait_for_selector("#update_history_form", timeout=timeout)
+    frame.wait_for_selector("div.question", timeout=timeout)
+    if student_id is not None and _frame_user(frame.url) not in (None, str(student_id)):
+        raise RuntimeError(f"SpeedGrader is showing another student's quiz page (user_id={_frame_user(frame.url)})")
+    frame.evaluate(CLASSIC_QUIZ_JS)
+    return frame
+
+
+def grade_classic_quiz_student(page, base_url: str, course_id: str, assignment_id: str, entry: dict,
+                               dry_run: bool, log, net_errors: list = None, questions: list = None) -> float:
+    """Classic Quiz: open this student's SpeedGrader, enter each question's points and Additional Comments on the quiz page and click Update Scores.
+    Returns the quiz's Final Score (in a dry run the page is only read and the expected Final Score is returned)"""
+    from playwright.sync_api import Error as PlaywrightError
+    sid = entry["student_id"]
+    page.goto(f"{base_url}/courses/{course_id}/gradebook/speed_grader?assignment_id={assignment_id}"
+              f"&student_id={sid}", wait_until="domcontentloaded", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+    frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT, sid)
+    # question number → question on the page: match by id when rubric.json has question ids (safe even if the order changed), otherwise by "Question N"
+    ids = {int(qm["position"]): str(qm["id"]) for qm in questions or [] if qm.get("id")}
+
+    def read_raw(f):   # every question on the page, keyed by the page's "Question N" number
+        return {int(k): v for k, v in f.evaluate("() => window.__autograder_classic.read()").items()}
+
+    def read(f):       # keyed by the grades.csv question number
+        raw = read_raw(f)
+        if not ids:
+            return raw
+        by_id = {v["id"]: v for v in raw.values()}
+        return {q: by_id[qid] for q, qid in ids.items() if qid in by_id}
+
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if not meta["form"] or not meta["button"]:
+        raise RuntimeError("No \"Update Scores\" form on the quiz page — this account may not have permission to change this quiz's scores")
+
+    # only change the attempt grades.csv was graded on: the page shows the latest attempt by default; stop if it does not match manifest.csv
+    shown_attempt, want_attempt = _num(meta.get("version")), entry.get("expected_attempt")
+    if want_attempt and shown_attempt and int(shown_attempt) != int(want_attempt):
+        raise RuntimeError(f"The grading page shows attempt {int(shown_attempt)}, but manifest.csv (what grades.csv was graded on) records attempt "
+                           f"{int(want_attempt)} — skipping this student to avoid changing the wrong attempt")
+
+    targets = entry["question_scores"]
+    comments = entry.get("question_comments") or {}
+    unknown = sorted((set(targets) | set(comments)) - set(state))
+    if unknown:
+        raise RuntimeError("These questions are not on the quiz page: " + ", ".join(f"Q{q}" for q in unknown))
+    alnum = lambda t: re.sub(r"[^0-9a-z]+", "", (t or "").lower())
+    for qm in [] if ids else questions or []:
+        q, head = int(qm["position"]), alnum(qm.get("text"))[:40]
+        if q in state and len(head) >= 10 and head not in alnum(state[q]["text"]):
+            raise RuntimeError(f"Question {q} on the quiz page is not the same question as Q{q} in grades.csv (the question text differs); stopped to avoid grading the wrong question")
+    for q, v in targets.items():
+        mx = state[q]["max"]
+        if mx is not None and v > mx + 1e-9:
+            raise RuntimeError(f"Q{q} score {v:g} is above the question's maximum {mx:g}")
+
+    norm = lambda t: " ".join((t or "").split())
+    cur = lambda st: _num(st["hidden"]) if st["hidden"] not in (None, "") else None
+    changes = {q: v for q, v in targets.items() if cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9}
+    feedback = {q: t for q, t in comments.items() if norm(t) != norm(state[q]["comment"])}
+    fudge = _num(meta.get("fudge")) or 0.0
+    # expected Final Score: the scores of all questions on the page (new scores for the ones filled in grades.csv) + Fudge Points
+    new_by_id = {state[q]["id"]: v for q, v in targets.items()}
+    after = {n: new_by_id.get(st["id"], cur(st)) for n, st in read_raw(frame).items()}
+    expected = sum(v for v in after.values() if v is not None) + fudge
+
+    describe = lambda q: state[q]["hidden"] or "--"
+    plan = ", ".join(f"Q{q} {describe(q)}→{v:g}" for q, v in sorted(changes.items()))
+    log("      Question scores: " + (plan or "already match grades.csv") + (f"; Fudge Points {fudge:+g}" if fudge else "")
+        + (f"  (attempt {int(shown_attempt)})" if shown_attempt else ""))
+    if comments:
+        log("      Additional Comments: " + (", ".join(f"Q{q}" for q in sorted(feedback)) + " to be written" if feedback
+                                          else "all already in the quiz"))
+    replaced = [q for q in feedback if norm(state[q]["comment"])]
+    if replaced:
+        log("      ⚠️ These questions already have comments, which will be replaced by the ones in grades.csv: " + ", ".join(f"Q{q}" for q in sorted(replaced)))
+    blank = sorted(q for q, v in after.items() if v is None)
+    if blank:
+        log("      ⚠️ These questions on the quiz page have no score yet, so the Final Score may be incomplete: " + ", ".join(f"Question {n}" for n in blank))
+    if dry_run:
+        return expected
+
+    shown = _classic_final_score(meta.get("final"))
+    if not changes and not feedback and shown is not None and abs(shown - expected) < 1e-6:
+        log("      Quiz scores and comments are already up to date, no need to click Update Scores")
+        return expected
+
+    select_all = "Meta+A" if sys.platform == "darwin" else "Control+A"
+    for q, v in sorted(changes.items()):
+        qid = state[q]["id"]
+        inp = frame.locator(f'input[name="question_score_{qid}_visible"]').first
+        inp.scroll_into_view_if_needed()
+        inp.click()
+        inp.press(select_all)
+        inp.press("Backspace")
+        inp.press_sequentially(f"{v:g}", delay=30)
+        inp.press("Tab")
+        page.wait_for_timeout(200)
+        st = read(frame)[q]
+        if cur(st) is None or abs(cur(st) - v) > 1e-9:
+            frame.evaluate("(id) => window.__autograder_classic.resync(id)", qid)
+            page.wait_for_timeout(200)
+            st = read(frame)[q]
+        if _num(st["value"]) is None or abs(_num(st["value"]) - v) > 1e-9 or cur(st) is None or abs(cur(st) - v) > 1e-9:
+            raise RuntimeError(f"after typing {v:g} into Q{q} the box shows {st['value']!r} and the score to submit is {st['hidden']!r}")
+    for q, text in sorted(feedback.items()):
+        box = frame.locator(f'textarea[name="question_comment_{state[q]["id"]}"]').first
+        box.scroll_into_view_if_needed()
+        box.fill(text)
+        if norm(read(frame)[q]["comment"]) != norm(text):
+            raise RuntimeError(f"Q{q}: the comment did not go into Additional Comments")
+
+    # click Update Scores (form submit, the quiz page reloads); a marker tells when the page has been replaced by the reloaded one
+    frame.evaluate("() => { window.__autograder_marker = 'before-update'; }")
+    if net_errors is not None:
+        net_errors.clear()
+    frame.locator("#update_history_form button.update-scores").first.click()
+    deadline = time.time() + CLASSIC_QUIZ_UI_TIMEOUT / 1000
+    while True:
+        page.wait_for_timeout(700)
+        try:
+            frame = _classic_frame(page, 5_000)
+            if frame.evaluate("() => window.__autograder_marker || null") is None:
+                frame.wait_for_load_state("load", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+                frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT)
+                break
+        except PlaywrightError:
+            pass   # the page is reloading
+        if time.time() > deadline:
+            detail = "; ".join((net_errors or [])[-5:])
+            raise RuntimeError("The quiz page did not reload after clicking Update Scores" + (" — failed requests: " + detail if detail else ""))
+
+    before_action = meta.get("action")
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if before_action and meta.get("action") and meta["action"] != before_action:
+        raise RuntimeError("After Update Scores the quiz page shows a different submission, please check this student in SpeedGrader by hand")
+    wrong = [f"Q{q} ({state.get(q, {}).get('hidden')!r})" for q, v in targets.items()
+             if q not in state or cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9]
+    absent = [f"Q{q}" for q, t in comments.items() if q not in state or norm(state[q]["comment"]) != norm(t)]
+    shown = _classic_final_score(meta.get("final"))
+    if wrong or absent or shown is None or abs(shown - expected) > 1e-6:
+        detail = "; ".join((net_errors or [])[-5:])
+        raise RuntimeError(f"After Update Scores the quiz Final Score is {shown}, expected {expected:g}"
+                           + (" — wrong scores: " + ", ".join(wrong) if wrong else "")
+                           + (" — comments not saved: " + ", ".join(absent) if absent else "")
+                           + (" — failed requests: " + detail if detail else ""))
+    log(f"      ✅ Quiz updated: Final Score {shown:g}"
+        + (f", Additional Comments {', '.join(f'Q{q}' for q in sorted(feedback))}" if feedback else ""))
+    return expected
+
+
+def submit_classic_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                           delay: float, log, progress, stop_event: threading.Event,
+                           questions: list = None) -> tuple[int, int]:
+    """Classic Quiz: students with per-question scores are graded question by question on the quiz page in SpeedGrader; the rest (e.g. missing students) get the total directly via the API"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_classic_quiz_student)
+
+
+def resolve_submit_mode(mode: str, meta: dict, entries: list) -> tuple:
+    """Turn the submission mode chosen in ③ into api / new_quiz_ui / classic_quiz_ui. Returns (mode, note); (None, reason) when the mode cannot be used"""
+    kind = meta.get("submission_kind")
+    has_q = any(e.get("question_scores") for e in entries)
+    ui_kind = {"new_quiz_ui": "new_quiz", "classic_quiz_ui": "classic_quiz"}
+    kind_name = {"new_quiz": "New Quizzes", "classic_quiz": "Classic Quiz", "discussion": "Discussion posts",
+                 "assignment": "regular assignment (files / text / URL)"}
+    if mode == "auto":
+        if has_q and not meta.get("criteria") and kind in ui_kind.values():
+            return ("new_quiz_ui" if kind == "new_quiz" else "classic_quiz_ui"), ""
+        if kind == "new_quiz":
+            return "api", ("⚠️ This is a New Quizzes assignment, but grades.csv has no per-question columns (Q1, Q2, ...): only the total will be set via the API, "
+                           "and the questions in the quiz stay ungraded. Regenerate the grades.csv template to add per-question columns")
+        return "api", ""
+    if mode in ui_kind:
+        if kind != ui_kind[mode]:
+            return None, (f"The selected submission mode only works for {kind_name[ui_kind[mode]]} assignments, "
+                          f"but rubric.json says this assignment is {kind_name.get(kind, kind)}. Please choose another submission mode")
+        if meta.get("criteria"):
+            return None, "This assignment is graded with a rubric, so per-question modes do not apply. Please choose the API mode"
+        if not has_q:
+            return None, "grades.csv has no per-question columns (Q1, Q2, ...) or they are all empty, so per-question grading is not possible"
+        return mode, ""
+    if has_q and kind in ui_kind.values():
+        return "api", ("⚠️ API mode only submits the total and the overall comment: the per-question scores in grades.csv are not written into the quiz, "
+                       "and the comments in the Q<n>_comment columns are not submitted")
+    return "api", ""
+
+
+def attach_expected_attempts(entries: list, manifest: Path):
+    """Store the attempt recorded in manifest.csv (the one downloaded / graded) in entry["expected_attempt"]"""
+    if not manifest.exists():
+        return
+    with open(manifest, newline="", encoding="utf-8-sig") as f:
+        attempts = {(r.get("student_id") or "").strip(): _num((r.get("attempt") or "").strip())
+                    for r in csv.DictReader(f)}
+    for e in entries:
+        if attempts.get(e["student_id"]):
+            e["expected_attempt"] = int(attempts[e["student_id"]])
 
 
 # ============================================================================
@@ -2766,6 +3097,9 @@ class App(tk.Tk):
         self.extract = tk.BooleanVar(value=c.get("extract", True))
         self.grades_path = tk.StringVar(value=c.get("grades_path", ""))
         self.delay = tk.DoubleVar(value=c.get("delay", 0.5))
+        mode = c.get("submit_mode") if c.get("submit_mode") in {k for k, _, _ in SUBMIT_MODES} else "auto"
+        self.submit_mode = tk.StringVar(value=next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        self.submit_mode_help = tk.StringVar(value=next(h for k, _, h in SUBMIT_MODES if k == mode))
         self.status = tk.StringVar(value="Ready")
         self.assignment_info = tk.StringVar(value="No assignment fetched yet")
         solution = c.get("ai_solution", "")
@@ -2907,7 +3241,7 @@ class App(tk.Tk):
         self._button(acts, "All-in-one: Fetch → Template → Download", self.on_all_in_one, row=0, column=2, **pad)
 
         # --- ③ Submit Grades ---
-        sf = ttk.LabelFrame(submit, text="Bulk-submit rubric scores from grades.csv", padding=6)
+        sf = ttk.LabelFrame(submit, text="Bulk-submit grades from grades.csv", padding=6)
         sf.grid(row=0, column=0, sticky="ew", **pad)
         sf.columnconfigure(1, weight=1)
         ttk.Label(sf, text="grades.csv").grid(row=0, column=0, sticky="w", **pad)
@@ -2917,8 +3251,16 @@ class App(tk.Tk):
         ttk.Label(sf, text="Request delay (s)").grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(sf, from_=0.0, to=5.0, increment=0.1, textvariable=self.delay, width=6).grid(
             row=1, column=1, sticky="w", **pad)
+        ttk.Label(sf, text="Submission mode").grid(row=2, column=0, sticky="w", **pad)
+        mode_box = ttk.Combobox(sf, textvariable=self.submit_mode, state="readonly",
+                                values=[label for _, label, _ in SUBMIT_MODES])
+        mode_box.grid(row=2, column=1, columnspan=3, sticky="ew", **pad)
+        mode_box.bind("<<ComboboxSelected>>", self._on_submit_mode)
+        mode_help = ttk.Label(sf, textvariable=self.submit_mode_help, foreground="gray", justify="left")
+        mode_help.grid(row=3, column=1, columnspan=3, sticky="ew", padx=6)
+        self._autowrap(mode_help)
         sub_btns = ttk.Frame(sf)
-        sub_btns.grid(row=2, column=0, columnspan=4, sticky="w", **pad)
+        sub_btns.grid(row=4, column=0, columnspan=4, sticky="w", **pad)
         self._button(sub_btns, "Preview (Dry Run, no upload)", lambda: self.on_submit(dry_run=True), row=0, column=0, **pad)
         self._button(sub_btns, "Submit to Canvas", lambda: self.on_submit(dry_run=False), row=0, column=1, **pad)
         ttk.Label(sf, justify="left", foreground="gray", text=(
@@ -2926,8 +3268,10 @@ class App(tk.Tk):
             "• Blank score = criterion not graded; whole row blank = student skipped; rows whose student_id starts with # are not submitted\n"
             "• Column <criterion_id>_comment is that criterion's comment; the comment column is the overall comment\n"
             "• If the assignment has no rubric, the score column gives the total score directly\n"
-            "• Students with status missing (not submitted): every criterion gets 0; Canvas is checked first to confirm they still haven't submitted")).grid(
-            row=3, column=0, columnspan=4, sticky="w", **pad)
+            "• Students with status missing (not submitted): every criterion gets 0; Canvas is checked first to confirm they still haven't submitted\n"
+            "• Per-question quiz grading (New Quizzes / Classic Quiz): fill the Q1, Q2, ... columns in grades.csv (per-question comments go in Q<n>_comment), "
+            "and set the submission mode to “Auto” or the matching per-question mode")).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad)
 
         self._build_ai_tab(ai, pad)
 
@@ -3122,6 +3466,7 @@ class App(tk.Tk):
             "extract": self.extract.get(),
             "grades_path": self.grades_path.get().strip(),
             "delay": self._delay(),
+            "submit_mode": self._submit_mode_key(),
             "ai_solution": "." if self.ai_solution.get() == WHOLE_DIR else self.ai_solution.get(),
             "ai_template": self.ai_template_key,
             "ai_solutions_dir": self.ai_solutions_dir.get().strip(),
@@ -3136,6 +3481,12 @@ class App(tk.Tk):
     def _on_close(self):
         self._save_config()
         self.destroy()
+
+    def _submit_mode_key(self) -> str:
+        return next((k for k, label, _ in SUBMIT_MODES if label == self.submit_mode.get()), "auto")
+
+    def _on_submit_mode(self, _event=None):
+        self.submit_mode_help.set(next(h for k, _, h in SUBMIT_MODES if k == self._submit_mode_key()))
 
     def _delay(self) -> float:
         try:
@@ -3417,6 +3768,8 @@ class App(tk.Tk):
             questions, note = None, ""
             if assignment_kind(assignment) == "new_quiz" and not criteria:
                 questions, note = new_quiz_questions(api, course_id, str(assignment["id"]))
+            elif assignment_kind(assignment) == "classic_quiz" and not criteria:
+                questions, note = classic_quiz_questions(api, course_id, assignment)
             write_rubric_json(workspace, base_url, course_id, assignment, questions)
             backup = backup_file(grades) if grades.exists() else None
             write_grades_template(grades, criteria, students, with_comments, questions)
@@ -3535,15 +3888,22 @@ class App(tk.Tk):
         target = f"{meta.get('assignment_name')} (course {course_id}, assignment {aid})"
 
         n_missing = sum(1 for e in entries if e.get("missing"))
-        # New Quizzes with per-question scores (Q1, Q2, ...) in grades.csv: grade question by question in the quiz grading view in SpeedGrader
-        by_question = meta.get("submission_kind") == "new_quiz" and any(e.get("question_scores") for e in entries)
-        if meta.get("submission_kind") == "new_quiz" and not by_question:
-            self.log("⚠️ This is a New Quizzes assignment, but grades.csv has no per-question columns (Q1, Q2, ...): only the total will be set via the API, "
-                     "and the questions in the quiz stay ungraded. Regenerate the grades.csv template to add per-question columns")
+        # Submission mode: auto / API / New Quizzes per question / Classic Quiz per question (see SUBMIT_MODES)
+        mode, note = resolve_submit_mode(self._submit_mode_key(), meta, entries)
+        if mode is None:
+            messagebox.showwarning("Submission mode unavailable", note)
+            return
+        if note:
+            self.log(note)
+        self.log("Submission mode: " + next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        if mode == "classic_quiz_ui":
+            attach_expected_attempts(entries, grades.parent / "manifest.csv")
         if not dry_run:
             msg = (f"About to submit grades for {len(entries)} students to Canvas:\n\n{target}\n\n"
                    + ("A browser will open to enter each question's points in the SpeedGrader quiz grading view and click Update, then add the comment\n\n"
-                      if by_question else "")
+                      if mode == "new_quiz_ui" else "")
+                   + ("A browser will open to enter each question's points and Additional Comments on the SpeedGrader quiz page and click Update Scores, "
+                      "then add the comment\n\n" if mode == "classic_quiz_ui" else "")
                    + (f"{n_missing} of them have missing submissions and will get 0 on every criterion\n\n" if n_missing else "")
                    + (f"⚠️ {len(warnings)} warnings, see the log\n\n" if warnings else "")
                    + "Existing grades will be overwritten. Submit now?")
@@ -3554,9 +3914,12 @@ class App(tk.Tk):
         self._save_config()
 
         def work():
-            if by_question:
+            if mode == "new_quiz_ui":
                 return submit_new_quiz_ui(api, course_id, aid, entries, dry_run, delay,
                                           self.log, self.progress_cb, self.stop_event, meta.get("questions"))
+            if mode == "classic_quiz_ui":
+                return submit_classic_quiz_ui(api, course_id, aid, entries, dry_run, delay,
+                                              self.log, self.progress_cb, self.stop_event, meta.get("questions"))
             return submit_grades(api, course_id, aid, criteria, entries, dry_run, delay,
                                  self.log, self.progress_cb, self.stop_event)
 

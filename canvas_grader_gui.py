@@ -66,7 +66,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -87,6 +87,23 @@ LAB_RE = re.compile(r"\b(L\d{1,3})\b")
 DOWNLOAD_WORKERS = 4
 LOGIN_TIMEOUT = 300   # 等待手动登录的最长时间 (秒)
 NEW_QUIZ_UI_TIMEOUT = 90_000   # 在 SpeedGrader 里等待 New Quizzes 评分页加载的最长时间 (毫秒)
+CLASSIC_QUIZ_UI_TIMEOUT = 90_000   # 在 SpeedGrader 里等待 Classic Quiz 测验页加载 / 点 Update Scores 后重新加载的最长时间 (毫秒)
+# ③ 提交评分里的提交模式: (内部名, 显示文字, 说明)
+SUBMIT_MODES = [
+    ("auto", "自动 (按作业类型和 grades.csv 选择)",
+     "New Quizzes / Classic Quiz 作业且 grades.csv 有逐题分数列 (Q1, Q2, ...) 时, 在 SpeedGrader 里逐题给分; "
+     "其他情况用 API 提交总分 (有 Rubric 时提交 Rubric 评分)"),
+    ("api", "API: 只提交总分 / Rubric 评分 + 整体评语",
+     "用 Canvas API 直接改总分 (有 Rubric 时提交 Rubric 评分) 并添加整体评语。不会改测验里每道题的分数, "
+     "Q<n>_comment 列不会提交"),
+    ("new_quiz_ui", "New Quizzes: 在 SpeedGrader 里逐题给分 (Playwright)",
+     "打开浏览器, 在 New Quizzes 评分页里逐题填分 (Award full credit / Mark as incorrect / 部分分), "
+     "把 Q<n>_comment 写进该题的 Feedback, 点 Update; 整体评语用 API 添加"),
+    ("classic_quiz_ui", "Classic Quiz: 在 SpeedGrader 里逐题给分 + Additional Comments (Playwright)",
+     "打开浏览器, 在 Classic Quiz 的测验页里逐题填分, 把 Q<n>_comment 写进该题下面的 Additional Comments, "
+     "点 Update Scores; 整体评语用 API 添加。只改评分页默认显示的那次尝试 (最新一次); "
+     "和 manifest.csv 记录的尝试对不上时跳过该学生"),
+]
 QUESTION_COL_RE = re.compile(r"^Q(\d+)$")   # grades.csv 里 New Quizzes 的逐题分数列: Q1, Q2, ...
 QUESTION_COMMENT_COL_RE = re.compile(r"^Q(\d+)_comment$")   # 逐题评语列: Q1_comment, Q2_comment, ...
 JSON_PREFIX = "while(1);"   # Canvas 对 cookie 认证的 JSON 响应加的防劫持前缀
@@ -481,7 +498,7 @@ def unique_path(path: Path) -> Path:
 
 def write_rubric_json(workspace: Path, base_url: str, course_id: str, assignment: dict,
                       questions: list = None):
-    """questions: New Quizzes 的题目 [{"position", "points"}]; 不传时保留 rubric.json 里已有的"""
+    """questions: 测验的题目 [{"position", "points", "text", "id" (Classic Quiz)}]; 不传时保留 rubric.json 里已有的"""
     workspace.mkdir(parents=True, exist_ok=True)
     path = workspace / "rubric.json"
     if questions is None and path.exists():
@@ -532,9 +549,29 @@ def new_quiz_questions(api: "CanvasAPI", course_id: str, assignment_id: str) -> 
     return questions, ""
 
 
+def classic_quiz_questions(api: "CanvasAPI", course_id: str, assignment: dict) -> tuple[list, str]:
+    """Classic Quiz 的题目列表 (题号 + 分值 + 题干开头 + 题目 id), 用于 grades.csv 的逐题分数列。
+    题号和测验页上的 "Question N" 一致 (纯文字说明不编号)。有题组 (随机抽题) 时每个学生的题目不同, 返回空列表"""
+    quiz_id = assignment.get("quiz_id")
+    if not quiz_id:
+        return [], "找不到这个 Classic Quiz 的 quiz_id — 不加逐题分数列, 上传时只提交总分"
+    items = api.get_all(f"/courses/{course_id}/quizzes/{quiz_id}/questions")
+    if any(q.get("quiz_group_id") for q in items):
+        return [], "测验里有题组 (随机抽题), 每个学生的题目可能不同 — 不加逐题分数列, 上传时只提交总分"
+    questions, n = [], 0
+    for q in sorted(items, key=lambda q: q.get("position") or 0):
+        if q.get("question_type") == "text_only_question":
+            continue   # 纯文字说明: 测验页上不编号, 也不计分
+        n += 1
+        text = html_to_text(q.get("question_text") or "")
+        questions.append({"position": n, "points": q.get("points_possible"), "id": str(q.get("id")),
+                          "text": " ".join(text.split())[:80]})
+    return questions, ""
+
+
 def write_grades_template(path: Path, criteria: list, students: list, with_comments: bool,
                           questions: list = None):
-    """questions: New Quizzes 作业 (没有 rubric) 的题目, 每题加一列 Q<n> 逐题给分"""
+    """questions: 测验作业 (New Quizzes / Classic Quiz, 没有 rubric) 的题目, 每题加一列 Q<n> 逐题给分"""
     header = ["student_id", "student_name", "student_number", "section", "status"]
     legend = ["#rubric", "(此行为说明, 不会提交)", "", "", ""]
     if criteria:
@@ -1799,10 +1836,11 @@ def grade_new_quiz_student(page, base_url: str, course_id: str, assignment_id: s
     return expected
 
 
-def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
-                       delay: float, log, progress, stop_event: threading.Event,
-                       questions: list = None) -> tuple[int, int]:
-    """New Quizzes: 有逐题分数的学生在 SpeedGrader 里逐题给分, 其余 (如未提交的学生) 用 API 直接给总分"""
+def _submit_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                    delay: float, log, progress, stop_event: threading.Event,
+                    questions: list, grade_student) -> tuple[int, int]:
+    """有逐题分数的学生在 SpeedGrader 里逐题给分 (grade_student: New Quizzes / Classic Quiz 各自的页面操作),
+    其余 (如未提交的学生) 用 API 直接给总分"""
     try:
         from playwright.sync_api import Error as PlaywrightError, sync_playwright
     except ImportError:
@@ -1849,8 +1887,8 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
                     break
                 log(f"[{i}/{len(ui)}] {e['name']} ({e['student_id']}): {e['score']:g}")
                 try:
-                    final = grade_new_quiz_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
-                                                   net_errors, questions)
+                    final = grade_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
+                                          net_errors, questions)
                     if abs(final - e["score"]) > 1e-6:
                         log(f"      ⚠️ 测验总分 {final:g} 与 grades.csv 的 {e['score']:g} 不一致 (测验里可能有 Fudge Points "
                             "或其他题的分数)")
@@ -1885,6 +1923,299 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
             except PlaywrightError:
                 pass
     return success, failed
+
+
+def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                       delay: float, log, progress, stop_event: threading.Event,
+                       questions: list = None) -> tuple[int, int]:
+    """New Quizzes: 有逐题分数的学生在 SpeedGrader 里逐题给分, 其余 (如未提交的学生) 用 API 直接给总分"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_new_quiz_student)
+
+
+# ============================================================================
+# Classic Quiz: 在 SpeedGrader 的测验页 (测验历史页) 里逐题给分
+# ============================================================================
+# Classic Quiz 的评分页和 New Quizzes 不同: 每题只有一个分数输入框 (没有 Award full credit / ✕ 按钮),
+# 题目下面是 "Additional Comments:" 文本框, 页面底部是 Fudge Points 和 "Update Scores" (普通表单提交, 页面会重新加载)。
+# 页面结构 (iframe #submission-preview-iframe → /courses/<c>/quizzes/<q>/history):
+#   div.question#question_<id>   .question_name "Question 3"   .question_points "/ 2"
+#   input[name=question_score_<id>_visible]  (显示的分数, 输入后页面脚本同步到隐藏的 question_score_<id>)
+#   textarea[name=question_comment_<id>]     (Additional Comments)
+#   form#update_history_form  input[name=submission_version_number] (当前显示的是第几次尝试)  button.update-scores
+CLASSIC_QUIZ_JS = r"""
+(() => {
+  const questions = () => [...document.querySelectorAll('div.question')].filter(q => /^question_\d+$/.test(q.id));
+  const position = q => {
+    const t = q.querySelector('.question_name');
+    const m = t ? t.innerText.match(/\d+/) : null;
+    return m ? +m[0] : null;
+  };
+  window.__autograder_classic = {
+    read() {
+      const out = {};
+      for (const q of questions()) {
+        const n = position(q);
+        if (n === null) continue;
+        const id = q.id.slice('question_'.length);
+        const vis = q.querySelector(`input[name="question_score_${id}_visible"]`);
+        const hid = q.querySelector(`input[name="question_score_${id}"]`);
+        const cmt = q.querySelector(`textarea[name="question_comment_${id}"]`);
+        const pts = q.querySelector('.question_points');
+        const max = pts ? pts.innerText.match(/(\d+(?:\.\d+)?)/) : null;
+        const txt = q.querySelector('.question_text');
+        out[n] = {id, value: vis ? vis.value : null, hidden: hid ? hid.value : null, max: max ? +max[1] : null,
+                  comment: cmt ? cmt.value : null, text: txt ? txt.innerText.slice(0, 800) : ''};
+      }
+      return out;
+    },
+    meta() {
+      const val = sel => { const e = document.querySelector(sel); return e ? e.value : null; };
+      const fs = document.querySelector('.update_scores_final_score');
+      const form = document.querySelector('#update_history_form');
+      return {form: !!form, action: form ? form.getAttribute('action') : null,
+              button: !!document.querySelector('#update_history_form button.update-scores'),
+              fudge: val('#fudge_points_input'),
+              version: val('#update_history_form input[name="submission_version_number"]'),
+              final: fs ? fs.innerText : ''};
+    },
+    // 页面脚本 (jQuery) 在 change 事件里把显示的分数同步到隐藏字段; 键盘输入没有触发时补一次
+    resync(id) {
+      const vis = document.querySelector(`input[name="question_score_${id}_visible"]`);
+      if (!vis) return false;
+      if (window.jQuery) window.jQuery(vis).trigger('change');
+      else vis.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    },
+  };
+  return true;
+})()
+"""
+
+
+def _classic_final_score(text: str):
+    """"Final Score: 19 out of 21" -> 19"""
+    found = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:out of|/)\s*\d+(?:\.\d+)?", text or "")
+    return float(found[-1]) if found else None
+
+
+def _frame_user(url: str):
+    return (parse_qs(urlparse(url or "").query).get("user_id") or [None])[0]
+
+
+def _classic_frame(page, timeout: int, student_id: str = None):
+    """SpeedGrader 里的测验页 (iframe); 测验页加载出表单后返回 Frame。
+    给了 student_id 时还要等到 iframe 换成该学生的测验页 (URL 里的 user_id), 避免给上一个学生的页面填分"""
+    deadline = time.time() + timeout / 1000
+    while True:
+        handle = page.locator("#submission-preview-iframe").element_handle(timeout=timeout)
+        frame = handle.content_frame() if handle else None
+        if frame is not None and "/quizzes/" in (frame.url or ""):
+            uid = _frame_user(frame.url)
+            if student_id is None or uid is None or uid == str(student_id):
+                break
+        if time.time() > deadline:
+            if frame is None:
+                raise RuntimeError("找不到测验评分页 (iframe)")
+            raise RuntimeError(f"SpeedGrader 没有打开该学生的测验页 (iframe 里是 user_id={_frame_user(frame.url)})")
+        page.wait_for_timeout(300)
+    frame.wait_for_selector("#update_history_form", timeout=timeout)
+    frame.wait_for_selector("div.question", timeout=timeout)
+    if student_id is not None and _frame_user(frame.url) not in (None, str(student_id)):
+        raise RuntimeError(f"SpeedGrader 显示的是另一个学生的测验页 (user_id={_frame_user(frame.url)})")
+    frame.evaluate(CLASSIC_QUIZ_JS)
+    return frame
+
+
+def grade_classic_quiz_student(page, base_url: str, course_id: str, assignment_id: str, entry: dict,
+                               dry_run: bool, log, net_errors: list = None, questions: list = None) -> float:
+    """Classic Quiz: 打开该学生的 SpeedGrader, 在测验页里逐题填分、写 Additional Comments 并点 Update Scores。
+    返回测验的 Final Score (dry run 时只读取页面, 返回预计的 Final Score)"""
+    from playwright.sync_api import Error as PlaywrightError
+    sid = entry["student_id"]
+    page.goto(f"{base_url}/courses/{course_id}/gradebook/speed_grader?assignment_id={assignment_id}"
+              f"&student_id={sid}", wait_until="domcontentloaded", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+    frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT, sid)
+    # 题号 → 测验页上的题: rubric.json 有题目 id 时按 id 对 (题目顺序变了也不会给错题), 否则按 "Question N"
+    ids = {int(qm["position"]): str(qm["id"]) for qm in questions or [] if qm.get("id")}
+
+    def read_raw(f):   # 测验页上所有的题, 按页面上的 "Question N" 编号
+        return {int(k): v for k, v in f.evaluate("() => window.__autograder_classic.read()").items()}
+
+    def read(f):       # 按 grades.csv 的题号
+        raw = read_raw(f)
+        if not ids:
+            return raw
+        by_id = {v["id"]: v for v in raw.values()}
+        return {q: by_id[qid] for q, qid in ids.items() if qid in by_id}
+
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if not meta["form"] or not meta["button"]:
+        raise RuntimeError("测验页里找不到 \"Update Scores\" 表单 — 当前账号可能没有修改这个测验分数的权限")
+
+    # 只改 grades.csv 批改的那次尝试: 评分页默认显示最新一次, 和 manifest.csv 记录的对不上时停止
+    shown_attempt, want_attempt = _num(meta.get("version")), entry.get("expected_attempt")
+    if want_attempt and shown_attempt and int(shown_attempt) != int(want_attempt):
+        raise RuntimeError(f"评分页显示的是第 {int(shown_attempt)} 次尝试, 但 manifest.csv 记录 (grades.csv 批改) 的是第 "
+                           f"{int(want_attempt)} 次 — 为避免改错尝试, 跳过该学生")
+
+    targets = entry["question_scores"]
+    comments = entry.get("question_comments") or {}
+    unknown = sorted((set(targets) | set(comments)) - set(state))
+    if unknown:
+        raise RuntimeError("测验页里找不到这些题: " + ", ".join(f"Q{q}" for q in unknown))
+    alnum = lambda t: re.sub(r"[^0-9a-z]+", "", (t or "").lower())
+    for qm in [] if ids else questions or []:
+        q, head = int(qm["position"]), alnum(qm.get("text"))[:40]
+        if q in state and len(head) >= 10 and head not in alnum(state[q]["text"]):
+            raise RuntimeError(f"测验页上的第 {q} 题和 grades.csv 的 Q{q} 不是同一道题 (题干对不上), 为避免给错分, 已停止")
+    for q, v in targets.items():
+        mx = state[q]["max"]
+        if mx is not None and v > mx + 1e-9:
+            raise RuntimeError(f"Q{q} 的分数 {v:g} 超过这道题的满分 {mx:g}")
+
+    norm = lambda t: " ".join((t or "").split())
+    cur = lambda st: _num(st["hidden"]) if st["hidden"] not in (None, "") else None
+    changes = {q: v for q, v in targets.items() if cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9}
+    feedback = {q: t for q, t in comments.items() if norm(t) != norm(state[q]["comment"])}
+    fudge = _num(meta.get("fudge")) or 0.0
+    # 预计的 Final Score: 测验页上所有题的分数 (grades.csv 填了的题换成新分数) + Fudge Points
+    new_by_id = {state[q]["id"]: v for q, v in targets.items()}
+    after = {n: new_by_id.get(st["id"], cur(st)) for n, st in read_raw(frame).items()}
+    expected = sum(v for v in after.values() if v is not None) + fudge
+
+    describe = lambda q: state[q]["hidden"] or "--"
+    plan = ", ".join(f"Q{q} {describe(q)}→{v:g}" for q, v in sorted(changes.items()))
+    log("      逐题分数: " + (plan or "已与 grades.csv 一致") + (f"; Fudge Points {fudge:+g}" if fudge else "")
+        + (f"  (第 {int(shown_attempt)} 次尝试)" if shown_attempt else ""))
+    if comments:
+        log("      Additional Comments: " + (", ".join(f"Q{q}" for q in sorted(feedback)) + " 待写入" if feedback
+                                          else "已经都在测验里"))
+    replaced = [q for q in feedback if norm(state[q]["comment"])]
+    if replaced:
+        log("      ⚠️ 这些题原来已有评语, 会被 grades.csv 的评语替换: " + ", ".join(f"Q{q}" for q in sorted(replaced)))
+    blank = sorted(q for q, v in after.items() if v is None)
+    if blank:
+        log("      ⚠️ 测验页上这些题还没有分数, Final Score 可能不完整: " + ", ".join(f"Question {n}" for n in blank))
+    if dry_run:
+        return expected
+
+    shown = _classic_final_score(meta.get("final"))
+    if not changes and not feedback and shown is not None and abs(shown - expected) < 1e-6:
+        log("      测验分数和评语都已是最新, 不需要 Update Scores")
+        return expected
+
+    select_all = "Meta+A" if sys.platform == "darwin" else "Control+A"
+    for q, v in sorted(changes.items()):
+        qid = state[q]["id"]
+        inp = frame.locator(f'input[name="question_score_{qid}_visible"]').first
+        inp.scroll_into_view_if_needed()
+        inp.click()
+        inp.press(select_all)
+        inp.press("Backspace")
+        inp.press_sequentially(f"{v:g}", delay=30)
+        inp.press("Tab")
+        page.wait_for_timeout(200)
+        st = read(frame)[q]
+        if cur(st) is None or abs(cur(st) - v) > 1e-9:
+            frame.evaluate("(id) => window.__autograder_classic.resync(id)", qid)
+            page.wait_for_timeout(200)
+            st = read(frame)[q]
+        if _num(st["value"]) is None or abs(_num(st["value"]) - v) > 1e-9 or cur(st) is None or abs(cur(st) - v) > 1e-9:
+            raise RuntimeError(f"Q{q} 输入 {v:g} 后输入框是 {st['value']!r}, 提交用的分数是 {st['hidden']!r}")
+    for q, text in sorted(feedback.items()):
+        box = frame.locator(f'textarea[name="question_comment_{state[q]["id"]}"]').first
+        box.scroll_into_view_if_needed()
+        box.fill(text)
+        if norm(read(frame)[q]["comment"]) != norm(text):
+            raise RuntimeError(f"Q{q}: 评语没有写进 Additional Comments")
+
+    # 点 Update Scores (表单提交, 测验页会重新加载); 用标记判断页面已经换成新加载的那一份
+    frame.evaluate("() => { window.__autograder_marker = 'before-update'; }")
+    if net_errors is not None:
+        net_errors.clear()
+    frame.locator("#update_history_form button.update-scores").first.click()
+    deadline = time.time() + CLASSIC_QUIZ_UI_TIMEOUT / 1000
+    while True:
+        page.wait_for_timeout(700)
+        try:
+            frame = _classic_frame(page, 5_000)
+            if frame.evaluate("() => window.__autograder_marker || null") is None:
+                frame.wait_for_load_state("load", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+                frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT)
+                break
+        except PlaywrightError:
+            pass   # 页面正在重新加载
+        if time.time() > deadline:
+            detail = "; ".join((net_errors or [])[-5:])
+            raise RuntimeError("点 Update Scores 后测验页没有重新加载" + (" — 出错的请求: " + detail if detail else ""))
+
+    before_action = meta.get("action")
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if before_action and meta.get("action") and meta["action"] != before_action:
+        raise RuntimeError("点 Update Scores 后测验页显示的不是同一份提交, 请在 SpeedGrader 里手动核对该学生")
+    wrong = [f"Q{q} ({state.get(q, {}).get('hidden')!r})" for q, v in targets.items()
+             if q not in state or cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9]
+    absent = [f"Q{q}" for q, t in comments.items() if q not in state or norm(state[q]["comment"]) != norm(t)]
+    shown = _classic_final_score(meta.get("final"))
+    if wrong or absent or shown is None or abs(shown - expected) > 1e-6:
+        detail = "; ".join((net_errors or [])[-5:])
+        raise RuntimeError(f"点 Update Scores 后测验的 Final Score 是 {shown}, 预期 {expected:g}"
+                           + (" — 分数不对: " + ", ".join(wrong) if wrong else "")
+                           + (" — 评语没有保存: " + ", ".join(absent) if absent else "")
+                           + (" — 出错的请求: " + detail if detail else ""))
+    log(f"      ✅ 测验已更新: Final Score {shown:g}"
+        + (f", Additional Comments {', '.join(f'Q{q}' for q in sorted(feedback))}" if feedback else ""))
+    return expected
+
+
+def submit_classic_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                           delay: float, log, progress, stop_event: threading.Event,
+                           questions: list = None) -> tuple[int, int]:
+    """Classic Quiz: 有逐题分数的学生在 SpeedGrader 的测验页里逐题给分, 其余 (如未提交的学生) 用 API 直接给总分"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_classic_quiz_student)
+
+
+def resolve_submit_mode(mode: str, meta: dict, entries: list) -> tuple:
+    """把 ③ 里选的提交模式落实成 api / new_quiz_ui / classic_quiz_ui。返回 (模式, 提示); 模式不可用时返回 (None, 原因)"""
+    kind = meta.get("submission_kind")
+    has_q = any(e.get("question_scores") for e in entries)
+    ui_kind = {"new_quiz_ui": "new_quiz", "classic_quiz_ui": "classic_quiz"}
+    kind_name = {"new_quiz": "New Quizzes", "classic_quiz": "Classic Quiz", "discussion": "讨论帖 (Discussion)",
+                 "assignment": "普通作业 (文件 / 文字 / 链接)"}
+    if mode == "auto":
+        if has_q and not meta.get("criteria") and kind in ui_kind.values():
+            return ("new_quiz_ui" if kind == "new_quiz" else "classic_quiz_ui"), ""
+        if kind == "new_quiz":
+            return "api", ("⚠️ 这是 New Quizzes 作业, 但 grades.csv 没有逐题分数列 (Q1, Q2, ...): 只会用 API 改总分, "
+                           "测验里的题目仍是未批改状态。重新生成 grades.csv 模板可以加上逐题分数列")
+        return "api", ""
+    if mode in ui_kind:
+        if kind != ui_kind[mode]:
+            return None, (f"所选的提交模式只适用于 {kind_name[ui_kind[mode]]} 作业, "
+                          f"但 rubric.json 里这个作业是 {kind_name.get(kind, kind)}。请换一个提交模式")
+        if meta.get("criteria"):
+            return None, "这个作业用 Rubric 评分, 逐题给分的模式不适用, 请选 API 模式"
+        if not has_q:
+            return None, "grades.csv 里没有逐题分数列 (Q1, Q2, ...) 或这些列都是空的, 无法逐题给分"
+        return mode, ""
+    if has_q and kind in ui_kind.values():
+        return "api", ("⚠️ API 模式只提交总分和整体评语: grades.csv 里的逐题分数不会写进测验, "
+                       "Q<n>_comment 列的评语不会提交")
+    return "api", ""
+
+
+def attach_expected_attempts(entries: list, manifest: Path):
+    """把 manifest.csv 里记录的尝试次数 (下载 / 批改时的那次) 记到 entry["expected_attempt"]"""
+    if not manifest.exists():
+        return
+    with open(manifest, newline="", encoding="utf-8-sig") as f:
+        attempts = {(r.get("student_id") or "").strip(): _num((r.get("attempt") or "").strip())
+                    for r in csv.DictReader(f)}
+    for e in entries:
+        if attempts.get(e["student_id"]):
+            e["expected_attempt"] = int(attempts[e["student_id"]])
 
 
 # ============================================================================
@@ -2763,6 +3094,9 @@ class App(tk.Tk):
         self.extract = tk.BooleanVar(value=c.get("extract", True))
         self.grades_path = tk.StringVar(value=c.get("grades_path", ""))
         self.delay = tk.DoubleVar(value=c.get("delay", 0.5))
+        mode = c.get("submit_mode") if c.get("submit_mode") in {k for k, _, _ in SUBMIT_MODES} else "auto"
+        self.submit_mode = tk.StringVar(value=next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        self.submit_mode_help = tk.StringVar(value=next(h for k, _, h in SUBMIT_MODES if k == mode))
         self.status = tk.StringVar(value="就绪")
         self.assignment_info = tk.StringVar(value="尚未抓取作业")
         solution = c.get("ai_solution", "")
@@ -2904,7 +3238,7 @@ class App(tk.Tk):
         self._button(acts, "一键完成: 抓取 → 模板 → 下载", self.on_all_in_one, row=0, column=2, **pad)
 
         # --- ③ 提交评分 ---
-        sf = ttk.LabelFrame(submit, text="从 grades.csv 批量提交 Rubric 评分", padding=6)
+        sf = ttk.LabelFrame(submit, text="从 grades.csv 批量提交评分", padding=6)
         sf.grid(row=0, column=0, sticky="ew", **pad)
         sf.columnconfigure(1, weight=1)
         ttk.Label(sf, text="grades.csv").grid(row=0, column=0, sticky="w", **pad)
@@ -2914,8 +3248,16 @@ class App(tk.Tk):
         ttk.Label(sf, text="请求间隔 (秒)").grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(sf, from_=0.0, to=5.0, increment=0.1, textvariable=self.delay, width=6).grid(
             row=1, column=1, sticky="w", **pad)
+        ttk.Label(sf, text="提交模式").grid(row=2, column=0, sticky="w", **pad)
+        mode_box = ttk.Combobox(sf, textvariable=self.submit_mode, state="readonly",
+                                values=[label for _, label, _ in SUBMIT_MODES])
+        mode_box.grid(row=2, column=1, columnspan=3, sticky="ew", **pad)
+        mode_box.bind("<<ComboboxSelected>>", self._on_submit_mode)
+        mode_help = ttk.Label(sf, textvariable=self.submit_mode_help, foreground="gray", justify="left")
+        mode_help.grid(row=3, column=1, columnspan=3, sticky="ew", padx=6)
+        self._autowrap(mode_help)
         sub_btns = ttk.Frame(sf)
-        sub_btns.grid(row=2, column=0, columnspan=4, sticky="w", **pad)
+        sub_btns.grid(row=4, column=0, columnspan=4, sticky="w", **pad)
         self._button(sub_btns, "预览 (Dry run, 不提交)", lambda: self.on_submit(dry_run=True), row=0, column=0, **pad)
         self._button(sub_btns, "提交到 Canvas", lambda: self.on_submit(dry_run=False), row=0, column=1, **pad)
         ttk.Label(sf, justify="left", foreground="gray", text=(
@@ -2923,8 +3265,10 @@ class App(tk.Tk):
             "• 分数留空 = 不评该项; 一行分数全空 = 跳过该学生; student_id 以 # 开头的行不会提交\n"
             "• 列 <criterion_id>_comment 为该项评语, comment 列为整体评语\n"
             "• 作业没有 rubric 时, 使用 score 列直接给总分\n"
-            "• status 为 missing (未提交) 的学生: 所有评分项记 0 分; 提交前会先向 Canvas 确认该学生仍未提交")).grid(
-            row=3, column=0, columnspan=4, sticky="w", **pad)
+            "• status 为 missing (未提交) 的学生: 所有评分项记 0 分; 提交前会先向 Canvas 确认该学生仍未提交\n"
+            "• 测验 (New Quizzes / Classic Quiz) 逐题给分: grades.csv 填 Q1, Q2, ... 列 (逐题评语填 Q<n>_comment), "
+            "提交模式选「自动」或对应的逐题模式")).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad)
 
         self._build_ai_tab(ai, pad)
 
@@ -3119,6 +3463,7 @@ class App(tk.Tk):
             "extract": self.extract.get(),
             "grades_path": self.grades_path.get().strip(),
             "delay": self._delay(),
+            "submit_mode": self._submit_mode_key(),
             "ai_solution": "." if self.ai_solution.get() == WHOLE_DIR else self.ai_solution.get(),
             "ai_template": self.ai_template_key,
             "ai_solutions_dir": self.ai_solutions_dir.get().strip(),
@@ -3133,6 +3478,12 @@ class App(tk.Tk):
     def _on_close(self):
         self._save_config()
         self.destroy()
+
+    def _submit_mode_key(self) -> str:
+        return next((k for k, label, _ in SUBMIT_MODES if label == self.submit_mode.get()), "auto")
+
+    def _on_submit_mode(self, _event=None):
+        self.submit_mode_help.set(next(h for k, _, h in SUBMIT_MODES if k == self._submit_mode_key()))
 
     def _delay(self) -> float:
         try:
@@ -3414,6 +3765,8 @@ class App(tk.Tk):
             questions, note = None, ""
             if assignment_kind(assignment) == "new_quiz" and not criteria:
                 questions, note = new_quiz_questions(api, course_id, str(assignment["id"]))
+            elif assignment_kind(assignment) == "classic_quiz" and not criteria:
+                questions, note = classic_quiz_questions(api, course_id, assignment)
             write_rubric_json(workspace, base_url, course_id, assignment, questions)
             backup = backup_file(grades) if grades.exists() else None
             write_grades_template(grades, criteria, students, with_comments, questions)
@@ -3532,15 +3885,22 @@ class App(tk.Tk):
         target = f"{meta.get('assignment_name')} (course {course_id}, assignment {aid})"
 
         n_missing = sum(1 for e in entries if e.get("missing"))
-        # New Quizzes 且 grades.csv 有逐题分数 (Q1, Q2, ...): 在 SpeedGrader 的测验评分页里逐题给分
-        by_question = meta.get("submission_kind") == "new_quiz" and any(e.get("question_scores") for e in entries)
-        if meta.get("submission_kind") == "new_quiz" and not by_question:
-            self.log("⚠️ 这是 New Quizzes 作业, 但 grades.csv 没有逐题分数列 (Q1, Q2, ...): 只会用 API 改总分, "
-                     "测验里的题目仍是未批改状态。重新生成 grades.csv 模板可以加上逐题分数列")
+        # 提交模式: 自动 / API / New Quizzes 逐题 / Classic Quiz 逐题 (见 SUBMIT_MODES)
+        mode, note = resolve_submit_mode(self._submit_mode_key(), meta, entries)
+        if mode is None:
+            messagebox.showwarning("提交模式不可用", note)
+            return
+        if note:
+            self.log(note)
+        self.log("提交模式: " + next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        if mode == "classic_quiz_ui":
+            attach_expected_attempts(entries, grades.parent / "manifest.csv")
         if not dry_run:
             msg = (f"将向 Canvas 提交 {len(entries)} 个学生的评分:\n\n{target}\n\n"
                    + ("会打开浏览器, 在 SpeedGrader 的测验评分页里逐题填分并点 Update, 再添加评论\n\n"
-                      if by_question else "")
+                      if mode == "new_quiz_ui" else "")
+                   + ("会打开浏览器, 在 SpeedGrader 的测验页里逐题填分、写 Additional Comments 并点 Update Scores, "
+                      "再添加评论\n\n" if mode == "classic_quiz_ui" else "")
                    + (f"其中 {n_missing} 名未提交的学生所有评分项记 0 分\n\n" if n_missing else "")
                    + (f"⚠️ 有 {len(warnings)} 条警告, 见日志\n\n" if warnings else "")
                    + "已有的评分会被覆盖。确定提交?")
@@ -3551,9 +3911,12 @@ class App(tk.Tk):
         self._save_config()
 
         def work():
-            if by_question:
+            if mode == "new_quiz_ui":
                 return submit_new_quiz_ui(api, course_id, aid, entries, dry_run, delay,
                                           self.log, self.progress_cb, self.stop_event, meta.get("questions"))
+            if mode == "classic_quiz_ui":
+                return submit_classic_quiz_ui(api, course_id, aid, entries, dry_run, delay,
+                                              self.log, self.progress_cb, self.stop_event, meta.get("questions"))
             return submit_grades(api, course_id, aid, criteria, entries, dry_run, delay,
                                  self.log, self.progress_cb, self.stop_event)
 

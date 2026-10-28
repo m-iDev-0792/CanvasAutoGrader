@@ -92,8 +92,9 @@ Excel 등 스프레드시트 프로그램으로 `grades.csv`를 여세요:
 ![③ 점수 제출](images/3_submit_ko.png)
 
 1. **[작업 폴더 파일 사용]**을 눌러 1단계의 grades.csv를 선택하세요.
-2. 먼저 **[미리보기 (Dry run, 업로드 안 함)]**을 눌러 로그에서 학생별 점수를 확인하세요.
-3. 문제가 없으면 **[Canvas에 제출]**을 누르세요. 점수가 SpeedGrader에 루브릭 평가로 표시됩니다.
+2. **[제출 모드]**를 고르세요. 보통은 [자동]이면 됩니다: 퀴즈(New Quizzes / Classic Quiz)의 grades.csv에 Q1, Q2, … 문항별 점수 열이 있으면 브라우저가 열려 SpeedGrader에서 문항별로 채점하고 (Classic Quiz는 문항별 코멘트를 각 문항 아래 Additional Comments에 입력), 그 외에는 API로 총점 / 루브릭 점수를 제출합니다.
+3. 먼저 **[미리보기 (Dry run, 업로드 안 함)]**을 눌러 로그에서 학생별 점수를 확인하세요.
+4. 문제가 없으면 **[Canvas에 제출]**을 누르세요. 점수가 SpeedGrader에 루브릭 평가로 표시됩니다.
 
 ---
 

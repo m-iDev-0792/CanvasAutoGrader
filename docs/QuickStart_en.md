@@ -92,8 +92,9 @@ An empty score means that criterion is not graded; a completely empty row skips 
 ![③ Submit Grades](images/3_submit_en.png)
 
 1. Click **“Use Workspace File”** to select the grades.csv from step 1.
-2. Click **“Preview (Dry Run, no upload)”** first and check every student's scores in the log.
-3. When everything looks right, click **“Submit to Canvas”**. The scores appear as rubric assessments in SpeedGrader.
+2. Pick a **“Submission mode”**. “Auto” is usually right: for a quiz (New Quizzes / Classic Quiz) whose grades.csv has per-question columns Q1, Q2, …, a browser opens and grades each question in SpeedGrader (for Classic Quiz the per-question comments go into the Additional Comments box under each question); otherwise the total / rubric scores are submitted via the API.
+3. Click **“Preview (Dry Run, no upload)”** first and check every student's scores in the log.
+4. When everything looks right, click **“Submit to Canvas”**. The scores appear as rubric assessments in SpeedGrader.
 
 ---
 

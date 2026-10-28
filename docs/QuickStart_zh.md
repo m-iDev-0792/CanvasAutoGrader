@@ -92,8 +92,9 @@ Quiz 还会在工作区生成 `quiz_questions.md` (题目 + 正确答案) 和 `q
 ![③ 提交评分](images/3_submit_zh.png)
 
 1. 点 **「用工作区里的」** 选中刚才的 grades.csv。
-2. 先点 **「预览 (Dry run, 不提交)」**，在日志里核对每个学生的分数。
-3. 确认无误后点 **「提交到 Canvas」**。分数会作为 Rubric 评分出现在 SpeedGrader 里。
+2. 选 **「提交模式」**。一般用「自动」：测验 (New Quizzes / Classic Quiz) 的 grades.csv 有 Q1, Q2, … 逐题分数列时，会打开浏览器在 SpeedGrader 里逐题给分（Classic Quiz 的逐题评语写进该题下面的 Additional Comments），其他情况用 API 提交总分 / Rubric 评分。
+3. 先点 **「预览 (Dry run, 不提交)」**，在日志里核对每个学生的分数。
+4. 确认无误后点 **「提交到 Canvas」**。分数会作为 Rubric 评分出现在 SpeedGrader 里。
 
 ---
 

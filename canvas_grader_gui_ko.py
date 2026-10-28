@@ -68,7 +68,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -89,6 +89,23 @@ LAB_RE = re.compile(r"\b(L\d{1,3})\b")
 DOWNLOAD_WORKERS = 4
 LOGIN_TIMEOUT = 300   # 수동 로그인 최대 대기 시간 (초)
 NEW_QUIZ_UI_TIMEOUT = 90_000   # SpeedGrader 안에서 New Quizzes 채점 화면이 로드될 때까지 기다리는 최대 시간 (밀리초)
+CLASSIC_QUIZ_UI_TIMEOUT = 90_000   # SpeedGrader 안에서 Classic Quiz 퀴즈 페이지가 로드될 때 / Update Scores 후 다시 로드될 때까지 기다리는 최대 시간 (밀리초)
+# ③ 점수 제출의 제출 모드: (내부 이름, 표시 문구, 설명)
+SUBMIT_MODES = [
+    ("auto", "자동 (과제 유형과 grades.csv에 따라 선택)",
+     "New Quizzes / Classic Quiz 과제이고 grades.csv에 문항별 점수 열(Q1, Q2, ...)이 있으면 SpeedGrader에서 문항별로 채점; "
+     "그 외에는 API로 총점을 제출 (루브릭이 있으면 루브릭 점수 제출)"),
+    ("api", "API: 총점 / 루브릭 점수 + 전체 코멘트만 제출",
+     "Canvas API로 총점을 직접 바꾸고 (루브릭이 있으면 루브릭 점수 제출) 전체 코멘트를 추가합니다. 퀴즈 안의 문항별 점수는 바뀌지 않고, "
+     "Q<n>_comment 열은 제출되지 않습니다"),
+    ("new_quiz_ui", "New Quizzes: SpeedGrader에서 문항별 채점 (Playwright)",
+     "브라우저를 열어 New Quizzes 채점 화면에서 문항별 점수를 입력하고 (Award full credit / Mark as incorrect / 부분 점수), "
+     "Q<n>_comment를 해당 문항의 Feedback에 쓰고 Update를 누릅니다; 전체 코멘트는 API로 추가"),
+    ("classic_quiz_ui", "Classic Quiz: SpeedGrader에서 문항별 채점 + Additional Comments (Playwright)",
+     "브라우저를 열어 Classic Quiz 퀴즈 페이지에서 문항별 점수를 입력하고, Q<n>_comment를 해당 문항 아래 Additional Comments에 쓴 뒤 "
+     "Update Scores를 누릅니다; 전체 코멘트는 API로 추가. 채점 화면에 기본으로 표시되는 시도(최신 시도)만 수정하며, "
+     "manifest.csv에 기록된 시도와 맞지 않으면 해당 학생은 건너뜁니다"),
+]
 QUESTION_COL_RE = re.compile(r"^Q(\d+)$")   # grades.csv의 New Quizzes 문항별 점수 열: Q1, Q2, ...
 QUESTION_COMMENT_COL_RE = re.compile(r"^Q(\d+)_comment$")   # 문항별 코멘트 열: Q1_comment, Q2_comment, ...
 JSON_PREFIX = "while(1);"   # Canvas가 cookie 인증 JSON 응답에 붙이는 하이재킹 방지 접두사
@@ -483,7 +500,7 @@ def unique_path(path: Path) -> Path:
 
 def write_rubric_json(workspace: Path, base_url: str, course_id: str, assignment: dict,
                       questions: list = None):
-    """questions: New Quizzes 문항 [{"position", "points"}]; 생략하면 rubric.json에 있던 것을 유지"""
+    """questions: 퀴즈 문항 [{"position", "points", "text", "id" (Classic Quiz)}]; 생략하면 rubric.json에 있던 것을 유지"""
     workspace.mkdir(parents=True, exist_ok=True)
     path = workspace / "rubric.json"
     if questions is None and path.exists():
@@ -534,9 +551,29 @@ def new_quiz_questions(api: "CanvasAPI", course_id: str, assignment_id: str) -> 
     return questions, ""
 
 
+def classic_quiz_questions(api: "CanvasAPI", course_id: str, assignment: dict) -> tuple[list, str]:
+    """Classic Quiz 문항 목록 (문항 번호 + 배점 + 문항 앞부분 + 문항 id), grades.csv의 문항별 점수 열에 사용.
+    문항 번호는 퀴즈 페이지의 "Question N"과 같음 (텍스트 전용 항목은 번호 없음). 문제 그룹(무작위 출제)이 있으면 학생마다 문항이 달라 빈 목록을 반환"""
+    quiz_id = assignment.get("quiz_id")
+    if not quiz_id:
+        return [], "이 Classic Quiz의 quiz_id를 찾을 수 없습니다 — 문항별 점수 열을 추가하지 않으며, 업로드 시 총점만 제출"
+    items = api.get_all(f"/courses/{course_id}/quizzes/{quiz_id}/questions")
+    if any(q.get("quiz_group_id") for q in items):
+        return [], "퀴즈에 문제 그룹(무작위 출제)이 있어 학생마다 문항이 다를 수 있습니다 — 문항별 점수 열을 추가하지 않으며, 업로드 시 총점만 제출"
+    questions, n = [], 0
+    for q in sorted(items, key=lambda q: q.get("position") or 0):
+        if q.get("question_type") == "text_only_question":
+            continue   # 텍스트 전용 항목: 퀴즈 페이지에서 번호가 없고 채점하지 않음
+        n += 1
+        text = html_to_text(q.get("question_text") or "")
+        questions.append({"position": n, "points": q.get("points_possible"), "id": str(q.get("id")),
+                          "text": " ".join(text.split())[:80]})
+    return questions, ""
+
+
 def write_grades_template(path: Path, criteria: list, students: list, with_comments: bool,
                           questions: list = None):
-    """questions: New Quizzes 과제(루브릭 없음)의 문항; 문항마다 Q<n> 열을 추가해 문항별로 채점"""
+    """questions: 퀴즈 과제(New Quizzes / Classic Quiz, 루브릭 없음)의 문항; 문항마다 Q<n> 열을 추가해 문항별로 채점"""
     header = ["student_id", "student_name", "student_number", "section", "status"]
     legend = ["#rubric", "(이 행은 설명이며 제출되지 않음)", "", "", ""]
     if criteria:
@@ -1801,10 +1838,11 @@ def grade_new_quiz_student(page, base_url: str, course_id: str, assignment_id: s
     return expected
 
 
-def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
-                       delay: float, log, progress, stop_event: threading.Event,
-                       questions: list = None) -> tuple[int, int]:
-    """New Quizzes: 문항별 점수가 있는 학생은 SpeedGrader에서 문항별로 채점하고, 나머지(예: 미제출 학생)는 API로 총점을 입력"""
+def _submit_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                    delay: float, log, progress, stop_event: threading.Event,
+                    questions: list, grade_student) -> tuple[int, int]:
+    """문항별 점수가 있는 학생은 SpeedGrader에서 문항별로 채점 (grade_student: New Quizzes / Classic Quiz 각각의 페이지 조작),
+    나머지(예: 미제출 학생)는 API로 총점을 직접 입력"""
     try:
         from playwright.sync_api import Error as PlaywrightError, sync_playwright
     except ImportError:
@@ -1851,8 +1889,8 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
                     break
                 log(f"[{i}/{len(ui)}] {e['name']} ({e['student_id']}): {e['score']:g}")
                 try:
-                    final = grade_new_quiz_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
-                                                   net_errors, questions)
+                    final = grade_student(page, api.base_url, course_id, assignment_id, e, dry_run, log,
+                                          net_errors, questions)
                     if abs(final - e["score"]) > 1e-6:
                         log(f"      ⚠️ 퀴즈 총점 {final:g}이(가) grades.csv의 {e['score']:g}와 다릅니다 (퀴즈에 Fudge Points "
                             "또는 다른 문항 점수가 있을 수 있음)")
@@ -1887,6 +1925,299 @@ def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entri
             except PlaywrightError:
                 pass
     return success, failed
+
+
+def submit_new_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                       delay: float, log, progress, stop_event: threading.Event,
+                       questions: list = None) -> tuple[int, int]:
+    """New Quizzes: 문항별 점수가 있는 학생은 SpeedGrader에서 문항별로 채점하고, 나머지(예: 미제출 학생)는 API로 총점을 입력"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_new_quiz_student)
+
+
+# ============================================================================
+# Classic Quiz: SpeedGrader의 퀴즈 페이지(퀴즈 기록 페이지)에서 문항별로 채점
+# ============================================================================
+# Classic Quiz 채점 페이지는 New Quizzes와 다름: 문항마다 점수 입력칸 하나만 있고 (Award full credit / ✕ 버튼 없음),
+# 문항 아래에 "Additional Comments:" 입력칸, 페이지 맨 아래에 Fudge Points와 "Update Scores"가 있음 (일반 폼 제출, 페이지가 다시 로드됨).
+# 페이지 구조 (iframe #submission-preview-iframe → /courses/<c>/quizzes/<q>/history):
+#   div.question#question_<id>   .question_name "Question 3"   .question_points "/ 2"
+#   input[name=question_score_<id>_visible]  (표시되는 점수, 입력하면 페이지 스크립트가 숨겨진 question_score_<id>에 동기화)
+#   textarea[name=question_comment_<id>]     (Additional Comments)
+#   form#update_history_form  input[name=submission_version_number] (현재 표시된 시도 번호)  button.update-scores
+CLASSIC_QUIZ_JS = r"""
+(() => {
+  const questions = () => [...document.querySelectorAll('div.question')].filter(q => /^question_\d+$/.test(q.id));
+  const position = q => {
+    const t = q.querySelector('.question_name');
+    const m = t ? t.innerText.match(/\d+/) : null;
+    return m ? +m[0] : null;
+  };
+  window.__autograder_classic = {
+    read() {
+      const out = {};
+      for (const q of questions()) {
+        const n = position(q);
+        if (n === null) continue;
+        const id = q.id.slice('question_'.length);
+        const vis = q.querySelector(`input[name="question_score_${id}_visible"]`);
+        const hid = q.querySelector(`input[name="question_score_${id}"]`);
+        const cmt = q.querySelector(`textarea[name="question_comment_${id}"]`);
+        const pts = q.querySelector('.question_points');
+        const max = pts ? pts.innerText.match(/(\d+(?:\.\d+)?)/) : null;
+        const txt = q.querySelector('.question_text');
+        out[n] = {id, value: vis ? vis.value : null, hidden: hid ? hid.value : null, max: max ? +max[1] : null,
+                  comment: cmt ? cmt.value : null, text: txt ? txt.innerText.slice(0, 800) : ''};
+      }
+      return out;
+    },
+    meta() {
+      const val = sel => { const e = document.querySelector(sel); return e ? e.value : null; };
+      const fs = document.querySelector('.update_scores_final_score');
+      const form = document.querySelector('#update_history_form');
+      return {form: !!form, action: form ? form.getAttribute('action') : null,
+              button: !!document.querySelector('#update_history_form button.update-scores'),
+              fudge: val('#fudge_points_input'),
+              version: val('#update_history_form input[name="submission_version_number"]'),
+              final: fs ? fs.innerText : ''};
+    },
+    // 페이지 스크립트(jQuery)가 change 이벤트에서 표시 점수를 숨겨진 필드에 동기화; 키보드 입력으로 실행되지 않았으면 한 번 더 실행
+    resync(id) {
+      const vis = document.querySelector(`input[name="question_score_${id}_visible"]`);
+      if (!vis) return false;
+      if (window.jQuery) window.jQuery(vis).trigger('change');
+      else vis.dispatchEvent(new Event('change', {bubbles: true}));
+      return true;
+    },
+  };
+  return true;
+})()
+"""
+
+
+def _classic_final_score(text: str):
+    """"Final Score: 19 out of 21" -> 19"""
+    found = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:out of|/)\s*\d+(?:\.\d+)?", text or "")
+    return float(found[-1]) if found else None
+
+
+def _frame_user(url: str):
+    return (parse_qs(urlparse(url or "").query).get("user_id") or [None])[0]
+
+
+def _classic_frame(page, timeout: int, student_id: str = None):
+    """SpeedGrader 안의 퀴즈 페이지(iframe); 퀴즈 페이지에 폼이 로드되면 Frame을 반환.
+    student_id가 주어지면 iframe이 해당 학생의 퀴즈 페이지(URL의 user_id)로 바뀔 때까지 기다려, 이전 학생의 페이지에 점수를 입력하지 않도록 함"""
+    deadline = time.time() + timeout / 1000
+    while True:
+        handle = page.locator("#submission-preview-iframe").element_handle(timeout=timeout)
+        frame = handle.content_frame() if handle else None
+        if frame is not None and "/quizzes/" in (frame.url or ""):
+            uid = _frame_user(frame.url)
+            if student_id is None or uid is None or uid == str(student_id):
+                break
+        if time.time() > deadline:
+            if frame is None:
+                raise RuntimeError("퀴즈 채점 화면(iframe)을 찾을 수 없습니다")
+            raise RuntimeError(f"SpeedGrader가 해당 학생의 퀴즈 페이지를 열지 않았습니다 (iframe은 user_id={_frame_user(frame.url)})")
+        page.wait_for_timeout(300)
+    frame.wait_for_selector("#update_history_form", timeout=timeout)
+    frame.wait_for_selector("div.question", timeout=timeout)
+    if student_id is not None and _frame_user(frame.url) not in (None, str(student_id)):
+        raise RuntimeError(f"SpeedGrader에 다른 학생의 퀴즈 페이지가 표시되어 있습니다 (user_id={_frame_user(frame.url)})")
+    frame.evaluate(CLASSIC_QUIZ_JS)
+    return frame
+
+
+def grade_classic_quiz_student(page, base_url: str, course_id: str, assignment_id: str, entry: dict,
+                               dry_run: bool, log, net_errors: list = None, questions: list = None) -> float:
+    """Classic Quiz: 해당 학생의 SpeedGrader를 열고 퀴즈 페이지에서 문항별 점수와 Additional Comments를 입력한 뒤 Update Scores를 누름.
+    퀴즈의 Final Score를 반환 (dry run에서는 페이지만 읽고 예상 Final Score를 반환)"""
+    from playwright.sync_api import Error as PlaywrightError
+    sid = entry["student_id"]
+    page.goto(f"{base_url}/courses/{course_id}/gradebook/speed_grader?assignment_id={assignment_id}"
+              f"&student_id={sid}", wait_until="domcontentloaded", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+    frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT, sid)
+    # 문항 번호 → 퀴즈 페이지의 문항: rubric.json에 문항 id가 있으면 id로 매칭 (순서가 바뀌어도 잘못 채점하지 않음), 없으면 "Question N"으로 매칭
+    ids = {int(qm["position"]): str(qm["id"]) for qm in questions or [] if qm.get("id")}
+
+    def read_raw(f):   # 퀴즈 페이지의 모든 문항, 페이지의 "Question N" 번호 기준
+        return {int(k): v for k, v in f.evaluate("() => window.__autograder_classic.read()").items()}
+
+    def read(f):       # grades.csv의 문항 번호 기준
+        raw = read_raw(f)
+        if not ids:
+            return raw
+        by_id = {v["id"]: v for v in raw.values()}
+        return {q: by_id[qid] for q, qid in ids.items() if qid in by_id}
+
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if not meta["form"] or not meta["button"]:
+        raise RuntimeError("퀴즈 페이지에서 \"Update Scores\" 폼을 찾을 수 없습니다 — 현재 계정에 이 퀴즈 점수를 수정할 권한이 없을 수 있습니다")
+
+    # grades.csv로 채점한 시도만 수정: 채점 화면은 기본으로 최신 시도를 표시하며, manifest.csv 기록과 맞지 않으면 중단
+    shown_attempt, want_attempt = _num(meta.get("version")), entry.get("expected_attempt")
+    if want_attempt and shown_attempt and int(shown_attempt) != int(want_attempt):
+        raise RuntimeError(f"채점 화면에는 {int(shown_attempt)}번째 시도가 표시되지만 manifest.csv(grades.csv로 채점한 시도)에는 "
+                           f"{int(want_attempt)}번째 시도로 기록되어 있습니다 — 잘못된 시도를 수정하지 않도록 이 학생은 건너뜁니다")
+
+    targets = entry["question_scores"]
+    comments = entry.get("question_comments") or {}
+    unknown = sorted((set(targets) | set(comments)) - set(state))
+    if unknown:
+        raise RuntimeError("퀴즈 페이지에서 찾을 수 없는 문항: " + ", ".join(f"Q{q}" for q in unknown))
+    alnum = lambda t: re.sub(r"[^0-9a-z]+", "", (t or "").lower())
+    for qm in [] if ids else questions or []:
+        q, head = int(qm["position"]), alnum(qm.get("text"))[:40]
+        if q in state and len(head) >= 10 and head not in alnum(state[q]["text"]):
+            raise RuntimeError(f"퀴즈 페이지의 {q}번 문항과 grades.csv의 Q{q}가 같은 문항이 아닙니다 (문항 내용 불일치) — 잘못 채점하지 않도록 중단했습니다")
+    for q, v in targets.items():
+        mx = state[q]["max"]
+        if mx is not None and v > mx + 1e-9:
+            raise RuntimeError(f"Q{q} 점수 {v:g}가 이 문항의 만점 {mx:g}을 넘습니다")
+
+    norm = lambda t: " ".join((t or "").split())
+    cur = lambda st: _num(st["hidden"]) if st["hidden"] not in (None, "") else None
+    changes = {q: v for q, v in targets.items() if cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9}
+    feedback = {q: t for q, t in comments.items() if norm(t) != norm(state[q]["comment"])}
+    fudge = _num(meta.get("fudge")) or 0.0
+    # 예상 Final Score: 퀴즈 페이지 모든 문항의 점수 (grades.csv에 입력된 문항은 새 점수) + Fudge Points
+    new_by_id = {state[q]["id"]: v for q, v in targets.items()}
+    after = {n: new_by_id.get(st["id"], cur(st)) for n, st in read_raw(frame).items()}
+    expected = sum(v for v in after.values() if v is not None) + fudge
+
+    describe = lambda q: state[q]["hidden"] or "--"
+    plan = ", ".join(f"Q{q} {describe(q)}→{v:g}" for q, v in sorted(changes.items()))
+    log("      문항별 점수: " + (plan or "이미 grades.csv와 같음") + (f"; Fudge Points {fudge:+g}" if fudge else "")
+        + (f"  ({int(shown_attempt)}번째 시도)" if shown_attempt else ""))
+    if comments:
+        log("      Additional Comments: " + (", ".join(f"Q{q}" for q in sorted(feedback)) + " 입력 예정" if feedback
+                                          else "모두 이미 퀴즈에 있음"))
+    replaced = [q for q in feedback if norm(state[q]["comment"])]
+    if replaced:
+        log("      ⚠️ 이 문항들은 이미 코멘트가 있으며 grades.csv의 코멘트로 바뀝니다: " + ", ".join(f"Q{q}" for q in sorted(replaced)))
+    blank = sorted(q for q, v in after.items() if v is None)
+    if blank:
+        log("      ⚠️ 퀴즈 페이지에서 아직 점수가 없는 문항이 있어 Final Score가 불완전할 수 있습니다: " + ", ".join(f"Question {n}" for n in blank))
+    if dry_run:
+        return expected
+
+    shown = _classic_final_score(meta.get("final"))
+    if not changes and not feedback and shown is not None and abs(shown - expected) < 1e-6:
+        log("      퀴즈 점수와 코멘트가 이미 최신이므로 Update Scores가 필요 없습니다")
+        return expected
+
+    select_all = "Meta+A" if sys.platform == "darwin" else "Control+A"
+    for q, v in sorted(changes.items()):
+        qid = state[q]["id"]
+        inp = frame.locator(f'input[name="question_score_{qid}_visible"]').first
+        inp.scroll_into_view_if_needed()
+        inp.click()
+        inp.press(select_all)
+        inp.press("Backspace")
+        inp.press_sequentially(f"{v:g}", delay=30)
+        inp.press("Tab")
+        page.wait_for_timeout(200)
+        st = read(frame)[q]
+        if cur(st) is None or abs(cur(st) - v) > 1e-9:
+            frame.evaluate("(id) => window.__autograder_classic.resync(id)", qid)
+            page.wait_for_timeout(200)
+            st = read(frame)[q]
+        if _num(st["value"]) is None or abs(_num(st["value"]) - v) > 1e-9 or cur(st) is None or abs(cur(st) - v) > 1e-9:
+            raise RuntimeError(f"Q{q}에 {v:g}를 입력한 뒤 입력칸은 {st['value']!r}, 제출될 점수는 {st['hidden']!r}입니다")
+    for q, text in sorted(feedback.items()):
+        box = frame.locator(f'textarea[name="question_comment_{state[q]["id"]}"]').first
+        box.scroll_into_view_if_needed()
+        box.fill(text)
+        if norm(read(frame)[q]["comment"]) != norm(text):
+            raise RuntimeError(f"Q{q}: 코멘트가 Additional Comments에 입력되지 않았습니다")
+
+    # Update Scores 클릭 (폼 제출, 퀴즈 페이지가 다시 로드됨); 표시값으로 페이지가 새로 로드되었는지 판단
+    frame.evaluate("() => { window.__autograder_marker = 'before-update'; }")
+    if net_errors is not None:
+        net_errors.clear()
+    frame.locator("#update_history_form button.update-scores").first.click()
+    deadline = time.time() + CLASSIC_QUIZ_UI_TIMEOUT / 1000
+    while True:
+        page.wait_for_timeout(700)
+        try:
+            frame = _classic_frame(page, 5_000)
+            if frame.evaluate("() => window.__autograder_marker || null") is None:
+                frame.wait_for_load_state("load", timeout=CLASSIC_QUIZ_UI_TIMEOUT)
+                frame = _classic_frame(page, CLASSIC_QUIZ_UI_TIMEOUT)
+                break
+        except PlaywrightError:
+            pass   # 페이지가 다시 로드되는 중
+        if time.time() > deadline:
+            detail = "; ".join((net_errors or [])[-5:])
+            raise RuntimeError("Update Scores 클릭 후 퀴즈 페이지가 다시 로드되지 않았습니다" + (" — 실패한 요청: " + detail if detail else ""))
+
+    before_action = meta.get("action")
+    state, meta = read(frame), frame.evaluate("() => window.__autograder_classic.meta()")
+    if before_action and meta.get("action") and meta["action"] != before_action:
+        raise RuntimeError("Update Scores 후 퀴즈 페이지에 다른 제출물이 표시됩니다. SpeedGrader에서 이 학생을 직접 확인하세요")
+    wrong = [f"Q{q} ({state.get(q, {}).get('hidden')!r})" for q, v in targets.items()
+             if q not in state or cur(state[q]) is None or abs(cur(state[q]) - v) > 1e-9]
+    absent = [f"Q{q}" for q, t in comments.items() if q not in state or norm(state[q]["comment"]) != norm(t)]
+    shown = _classic_final_score(meta.get("final"))
+    if wrong or absent or shown is None or abs(shown - expected) > 1e-6:
+        detail = "; ".join((net_errors or [])[-5:])
+        raise RuntimeError(f"Update Scores 후 퀴즈 Final Score는 {shown}, 예상값은 {expected:g}"
+                           + (" — 점수 불일치: " + ", ".join(wrong) if wrong else "")
+                           + (" — 저장되지 않은 코멘트: " + ", ".join(absent) if absent else "")
+                           + (" — 실패한 요청: " + detail if detail else ""))
+    log(f"      ✅ 퀴즈 업데이트됨: Final Score {shown:g}"
+        + (f", Additional Comments {', '.join(f'Q{q}' for q in sorted(feedback))}" if feedback else ""))
+    return expected
+
+
+def submit_classic_quiz_ui(api: CanvasAPI, course_id: str, assignment_id: str, entries: list, dry_run: bool,
+                           delay: float, log, progress, stop_event: threading.Event,
+                           questions: list = None) -> tuple[int, int]:
+    """Classic Quiz: 문항별 점수가 있는 학생은 SpeedGrader의 퀴즈 페이지에서 문항별로 채점하고, 나머지(예: 미제출 학생)는 API로 총점을 입력"""
+    return _submit_quiz_ui(api, course_id, assignment_id, entries, dry_run, delay, log, progress, stop_event,
+                           questions, grade_classic_quiz_student)
+
+
+def resolve_submit_mode(mode: str, meta: dict, entries: list) -> tuple:
+    """③에서 선택한 제출 모드를 api / new_quiz_ui / classic_quiz_ui로 확정. (모드, 안내)를 반환하며, 사용할 수 없는 모드면 (None, 이유)를 반환"""
+    kind = meta.get("submission_kind")
+    has_q = any(e.get("question_scores") for e in entries)
+    ui_kind = {"new_quiz_ui": "new_quiz", "classic_quiz_ui": "classic_quiz"}
+    kind_name = {"new_quiz": "New Quizzes", "classic_quiz": "Classic Quiz", "discussion": "토론 게시물 (Discussion)",
+                 "assignment": "일반 과제 (파일 / 텍스트 / 링크)"}
+    if mode == "auto":
+        if has_q and not meta.get("criteria") and kind in ui_kind.values():
+            return ("new_quiz_ui" if kind == "new_quiz" else "classic_quiz_ui"), ""
+        if kind == "new_quiz":
+            return "api", ("⚠️ New Quizzes 과제인데 grades.csv에 문항별 점수 열(Q1, Q2, ...)이 없습니다: API로 총점만 바뀌고, "
+                           "퀴즈의 문항은 채점되지 않은 상태로 남습니다. grades.csv 템플릿을 다시 만들면 문항별 점수 열이 추가됩니다")
+        return "api", ""
+    if mode in ui_kind:
+        if kind != ui_kind[mode]:
+            return None, (f"선택한 제출 모드는 {kind_name[ui_kind[mode]]} 과제에만 사용할 수 있지만, "
+                          f"rubric.json에 따르면 이 과제는 {kind_name.get(kind, kind)}입니다. 다른 제출 모드를 선택하세요")
+        if meta.get("criteria"):
+            return None, "이 과제는 루브릭으로 채점하므로 문항별 채점 모드를 쓸 수 없습니다. API 모드를 선택하세요"
+        if not has_q:
+            return None, "grades.csv에 문항별 점수 열(Q1, Q2, ...)이 없거나 모두 비어 있어 문항별로 채점할 수 없습니다"
+        return mode, ""
+    if has_q and kind in ui_kind.values():
+        return "api", ("⚠️ API 모드는 총점과 전체 코멘트만 제출합니다: grades.csv의 문항별 점수는 퀴즈에 입력되지 않고, "
+                       "Q<n>_comment 열의 코멘트는 제출되지 않습니다")
+    return "api", ""
+
+
+def attach_expected_attempts(entries: list, manifest: Path):
+    """manifest.csv에 기록된 시도 번호(다운로드 / 채점한 시도)를 entry["expected_attempt"]에 저장"""
+    if not manifest.exists():
+        return
+    with open(manifest, newline="", encoding="utf-8-sig") as f:
+        attempts = {(r.get("student_id") or "").strip(): _num((r.get("attempt") or "").strip())
+                    for r in csv.DictReader(f)}
+    for e in entries:
+        if attempts.get(e["student_id"]):
+            e["expected_attempt"] = int(attempts[e["student_id"]])
 
 
 # ============================================================================
@@ -2765,6 +3096,9 @@ class App(tk.Tk):
         self.extract = tk.BooleanVar(value=c.get("extract", True))
         self.grades_path = tk.StringVar(value=c.get("grades_path", ""))
         self.delay = tk.DoubleVar(value=c.get("delay", 0.5))
+        mode = c.get("submit_mode") if c.get("submit_mode") in {k for k, _, _ in SUBMIT_MODES} else "auto"
+        self.submit_mode = tk.StringVar(value=next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        self.submit_mode_help = tk.StringVar(value=next(h for k, _, h in SUBMIT_MODES if k == mode))
         self.status = tk.StringVar(value="준비됨")
         self.assignment_info = tk.StringVar(value="아직 과제를 가져오지 않음")
         solution = c.get("ai_solution", "")
@@ -2906,7 +3240,7 @@ class App(tk.Tk):
         self._button(acts, "한 번에: 가져오기 → 템플릿 → 다운로드", self.on_all_in_one, row=0, column=2, **pad)
 
         # --- ③ 점수 제출 ---
-        sf = ttk.LabelFrame(submit, text="grades.csv로 루브릭 점수 일괄 제출", padding=6)
+        sf = ttk.LabelFrame(submit, text="grades.csv로 점수 일괄 제출", padding=6)
         sf.grid(row=0, column=0, sticky="ew", **pad)
         sf.columnconfigure(1, weight=1)
         ttk.Label(sf, text="grades.csv").grid(row=0, column=0, sticky="w", **pad)
@@ -2916,8 +3250,16 @@ class App(tk.Tk):
         ttk.Label(sf, text="요청 간격 (초)").grid(row=1, column=0, sticky="w", **pad)
         ttk.Spinbox(sf, from_=0.0, to=5.0, increment=0.1, textvariable=self.delay, width=6).grid(
             row=1, column=1, sticky="w", **pad)
+        ttk.Label(sf, text="제출 모드").grid(row=2, column=0, sticky="w", **pad)
+        mode_box = ttk.Combobox(sf, textvariable=self.submit_mode, state="readonly",
+                                values=[label for _, label, _ in SUBMIT_MODES])
+        mode_box.grid(row=2, column=1, columnspan=3, sticky="ew", **pad)
+        mode_box.bind("<<ComboboxSelected>>", self._on_submit_mode)
+        mode_help = ttk.Label(sf, textvariable=self.submit_mode_help, foreground="gray", justify="left")
+        mode_help.grid(row=3, column=1, columnspan=3, sticky="ew", padx=6)
+        self._autowrap(mode_help)
         sub_btns = ttk.Frame(sf)
-        sub_btns.grid(row=2, column=0, columnspan=4, sticky="w", **pad)
+        sub_btns.grid(row=4, column=0, columnspan=4, sticky="w", **pad)
         self._button(sub_btns, "미리보기 (Dry run, 업로드 안 함)", lambda: self.on_submit(dry_run=True), row=0, column=0, **pad)
         self._button(sub_btns, "Canvas에 제출", lambda: self.on_submit(dry_run=False), row=0, column=1, **pad)
         ttk.Label(sf, justify="left", foreground="gray", text=(
@@ -2925,8 +3267,10 @@ class App(tk.Tk):
             "• 점수 빈칸 = 해당 항목 채점 안 함; 한 행이 모두 빈칸 = 해당 학생 건너뜀; student_id가 #으로 시작하는 행은 제출 안 됨\n"
             "• <criterion_id>_comment 열은 항목별 코멘트, comment 열은 전체 코멘트\n"
             "• 과제에 루브릭이 없으면 score 열로 총점을 직접 입력\n"
-            "• status가 missing (미제출)인 학생: 모든 평가 항목 0점 처리; 제출 전에 Canvas에서 여전히 미제출인지 확인합니다")).grid(
-            row=3, column=0, columnspan=4, sticky="w", **pad)
+            "• status가 missing (미제출)인 학생: 모든 평가 항목 0점 처리; 제출 전에 Canvas에서 여전히 미제출인지 확인합니다\n"
+            "• 퀴즈 (New Quizzes / Classic Quiz) 문항별 채점: grades.csv의 Q1, Q2, ... 열을 채우고 (문항별 코멘트는 Q<n>_comment), "
+            "제출 모드는 [자동] 또는 해당하는 문항별 모드를 선택")).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad)
 
         self._build_ai_tab(ai, pad)
 
@@ -3121,6 +3465,7 @@ class App(tk.Tk):
             "extract": self.extract.get(),
             "grades_path": self.grades_path.get().strip(),
             "delay": self._delay(),
+            "submit_mode": self._submit_mode_key(),
             "ai_solution": "." if self.ai_solution.get() == WHOLE_DIR else self.ai_solution.get(),
             "ai_template": self.ai_template_key,
             "ai_solutions_dir": self.ai_solutions_dir.get().strip(),
@@ -3135,6 +3480,12 @@ class App(tk.Tk):
     def _on_close(self):
         self._save_config()
         self.destroy()
+
+    def _submit_mode_key(self) -> str:
+        return next((k for k, label, _ in SUBMIT_MODES if label == self.submit_mode.get()), "auto")
+
+    def _on_submit_mode(self, _event=None):
+        self.submit_mode_help.set(next(h for k, _, h in SUBMIT_MODES if k == self._submit_mode_key()))
 
     def _delay(self) -> float:
         try:
@@ -3416,6 +3767,8 @@ class App(tk.Tk):
             questions, note = None, ""
             if assignment_kind(assignment) == "new_quiz" and not criteria:
                 questions, note = new_quiz_questions(api, course_id, str(assignment["id"]))
+            elif assignment_kind(assignment) == "classic_quiz" and not criteria:
+                questions, note = classic_quiz_questions(api, course_id, assignment)
             write_rubric_json(workspace, base_url, course_id, assignment, questions)
             backup = backup_file(grades) if grades.exists() else None
             write_grades_template(grades, criteria, students, with_comments, questions)
@@ -3534,15 +3887,22 @@ class App(tk.Tk):
         target = f"{meta.get('assignment_name')} (course {course_id}, assignment {aid})"
 
         n_missing = sum(1 for e in entries if e.get("missing"))
-        # New Quizzes이고 grades.csv에 문항별 점수(Q1, Q2, ...)가 있으면 SpeedGrader의 퀴즈 채점 화면에서 문항별로 채점
-        by_question = meta.get("submission_kind") == "new_quiz" and any(e.get("question_scores") for e in entries)
-        if meta.get("submission_kind") == "new_quiz" and not by_question:
-            self.log("⚠️ New Quizzes 과제인데 grades.csv에 문항별 점수 열(Q1, Q2, ...)이 없습니다: API로 총점만 바뀌고, "
-                     "퀴즈의 문항은 채점되지 않은 상태로 남습니다. grades.csv 템플릿을 다시 만들면 문항별 점수 열이 추가됩니다")
+        # 제출 모드: 자동 / API / New Quizzes 문항별 / Classic Quiz 문항별 (SUBMIT_MODES 참고)
+        mode, note = resolve_submit_mode(self._submit_mode_key(), meta, entries)
+        if mode is None:
+            messagebox.showwarning("제출 모드를 사용할 수 없음", note)
+            return
+        if note:
+            self.log(note)
+        self.log("제출 모드: " + next(label for k, label, _ in SUBMIT_MODES if k == mode))
+        if mode == "classic_quiz_ui":
+            attach_expected_attempts(entries, grades.parent / "manifest.csv")
         if not dry_run:
             msg = (f"학생 {len(entries)}명의 점수를 Canvas에 제출합니다:\n\n{target}\n\n"
                    + ("브라우저가 열리고 SpeedGrader의 퀴즈 채점 화면에서 문항별 점수를 입력한 뒤 Update를 누르고, 댓글을 추가합니다\n\n"
-                      if by_question else "")
+                      if mode == "new_quiz_ui" else "")
+                   + ("브라우저가 열리고 SpeedGrader의 퀴즈 페이지에서 문항별 점수와 Additional Comments를 입력한 뒤 Update Scores를 누르고, "
+                      "댓글을 추가합니다\n\n" if mode == "classic_quiz_ui" else "")
                    + (f"그중 미제출 학생 {n_missing}명은 모든 평가 항목이 0점 처리됩니다\n\n" if n_missing else "")
                    + (f"⚠️ 경고 {len(warnings)}건, 로그를 확인하세요\n\n" if warnings else "")
                    + "기존 점수는 덮어쓰게 됩니다. 제출할까요?")
@@ -3553,9 +3913,12 @@ class App(tk.Tk):
         self._save_config()
 
         def work():
-            if by_question:
+            if mode == "new_quiz_ui":
                 return submit_new_quiz_ui(api, course_id, aid, entries, dry_run, delay,
                                           self.log, self.progress_cb, self.stop_event, meta.get("questions"))
+            if mode == "classic_quiz_ui":
+                return submit_classic_quiz_ui(api, course_id, aid, entries, dry_run, delay,
+                                              self.log, self.progress_cb, self.stop_event, meta.get("questions"))
             return submit_grades(api, course_id, aid, criteria, entries, dry_run, delay,
                                  self.log, self.progress_cb, self.stop_event)
 
